@@ -1,0 +1,26 @@
+# build output
+/tsm2arc
+/cmd/tsm2arc/tsm2arc
+/dist/
+
+# fixture data (real InfluxDB volumes / generated TSM) — both 1.x and 2.x
+/fixture/data/
+/fixture/v2/data/
+
+# checkpoint stores
+*.checkpoint.db
+*.checkpoint.db-wal
+*.checkpoint.db-shm
+
+# SBOM / release scratch
+*.sbom.json
+*.spdx.json
+
+# macOS
+.DS_Store
+
+# editor
+*.swp
+*~
+.idea/
+.vscode/

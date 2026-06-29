@@ -1,0 +1,35 @@
+# InfluxDB 1.8 fixture for tsm2arc validation.
+#
+#   docker compose up -d
+#   ./seed.sh                      # write the known dataset
+#
+# To force WAL → TSM (so Phase-1's TSM reader has files to read):
+#   InfluxDB only snapshots a shard's cache to TSM after it has been idle for
+#   cache-snapshot-write-cold-duration. We set that to 1s below, so a few
+#   seconds after the last write the .tsm files appear. (Default is 10m, which
+#   is why tiny test datasets otherwise stay in the WAL indefinitely.)
+#   After seeding, wait ~5s and check:  find data/influxdb/data -name '*.tsm'
+#
+# NOTE: real customer cold volumes may ALSO have un-flushed WAL data — InfluxDB
+# does NOT flush WAL→TSM on shutdown. The WAL reader (Phase 4) covers that.
+#
+# Data dir on the host (what tsm2arc reads):
+#   ./data/influxdb/data/<db>/<rp>/<shard>/*.tsm
+#   ./data/influxdb/wal/<db>/<rp>/<shard>/*.wal
+#
+# Point tsm2arc at:
+#   --datadir ./fixture/data/influxdb/data
+#   --waldir  ./fixture/data/influxdb/wal
+services:
+  influxdb:
+    image: influxdb:1.8
+    container_name: tsm2arc-influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      - INFLUXDB_REPORTING_DISABLED=true
+      - INFLUXDB_HTTP_AUTH_ENABLED=false
+      # Snapshot idle shard caches to TSM almost immediately (default 10m).
+      - INFLUXDB_DATA_CACHE_SNAPSHOT_WRITE_COLD_DURATION=1s
+    volumes:
+      - ./data/influxdb:/var/lib/influxdb

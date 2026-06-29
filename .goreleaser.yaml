@@ -1,0 +1,92 @@
+version: 2
+
+project_name: tsm2arc
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: tsm2arc
+    main: ./cmd/tsm2arc
+    binary: tsm2arc
+    env:
+      - CGO_ENABLED=0 # pure-Go (modernc sqlite) — cross-compiles cleanly, no cgo
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.CommitDate}}
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    # Windows on arm64 is uncommon for a migration host; drop it.
+    ignore:
+      - goos: windows
+        goarch: arm64
+
+archives:
+  - id: tsm2arc
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+      - docs/RUNBOOK.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# Software Bill of Materials, one per archive, generated with syft.
+sboms:
+  - id: archive
+    artifacts: archive
+
+# Multi-arch container image (linux amd64 + arm64) pushed to GHCR as a single
+# manifest. dockers_v2 builds the multi-arch manifest in one entry (replaces the
+# old dockers + docker_manifests split).
+dockers_v2:
+  - id: tsm2arc
+    ids: [tsm2arc]
+    dockerfile: Dockerfile
+    images:
+      - ghcr.io/basekick-labs/tsm2arc
+    tags:
+      - "{{ .Version }}"
+      - "latest"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    labels:
+      org.opencontainers.image.source: "https://github.com/basekick-labs/tsm2arc"
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.licenses: "Apache-2.0"
+      org.opencontainers.image.description: "Migrate InfluxDB 1.x (TSM/WAL) data into Arc"
+
+release:
+  github:
+    owner: basekick-labs
+    name: tsm2arc
+  draft: false
+  prerelease: auto
+  footer: |
+    ---
+    **Container:** `ghcr.io/basekick-labs/tsm2arc:{{ .Version }}`
+
+    Each archive ships an SBOM (`*.sbom.json`, SPDX) and `checksums.txt`.
+    See [docs/RUNBOOK.md](https://github.com/basekick-labs/tsm2arc/blob/main/docs/RUNBOOK.md).
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "Merge pull request"

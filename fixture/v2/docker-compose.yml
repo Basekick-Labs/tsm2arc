@@ -1,0 +1,29 @@
+# InfluxDB 2.7 fixture for tsm2arc v2.x validation.
+#
+#   docker compose up -d
+#   # wait for setup, then seed:
+#   ./seed.sh
+#   # force WAL -> TSM:  the storage engine snapshots the cache to TSM after
+#   # storage-cache-snapshot-write-cold-duration; we set it low below.
+#
+# On-disk engine layout (what tsm2arc reads) lives under the mounted volume:
+#   ./data/engine/data/<bucket-id>/autogen/<shard-id>/*.tsm
+#   ./data/engine/wal/<bucket-id>/autogen/<shard-id>/*.wal
+# Bucket id<->name mapping is in ./data/influxd.bolt (BoltDB).
+services:
+  influxdb:
+    image: influxdb:2.7
+    container_name: tsm2arc-influxdb2
+    ports:
+      - "8087:8086"
+    environment:
+      - DOCKER_INFLUXDB_INIT_MODE=setup
+      - DOCKER_INFLUXDB_INIT_USERNAME=admin
+      - DOCKER_INFLUXDB_INIT_PASSWORD=password123
+      - DOCKER_INFLUXDB_INIT_ORG=basekick
+      - DOCKER_INFLUXDB_INIT_BUCKET=telemetry
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=tsm2arc-dev-token
+      # snapshot idle shard caches to TSM quickly so we get .tsm files for testing
+      - INFLUXD_STORAGE_CACHE_SNAPSHOT_WRITE_COLD_DURATION=2s
+    volumes:
+      - ./data:/var/lib/influxdb2
