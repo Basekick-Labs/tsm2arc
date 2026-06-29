@@ -1,9 +1,9 @@
-// Command tsm2arc extracts InfluxDB 1.x TSM data and loads it into Arc.
-//
-// Phase 1: discovery + extraction + --dry-run validation.
-// Phase 2: chunked gzip load into Arc /api/v1/import/lp with per-database
-//
-//	routing. (Resume/checkpoint is Phase 3; WAL is Phase 4.)
+// Command tsm2arc migrates InfluxDB 1.x and 2.x data into Arc by reading TSM and
+// WAL files directly off disk (no running influxd). It auto-detects the on-disk
+// layout, reconstructs multi-field line protocol, and loads it into Arc's
+// /api/v1/import/lp endpoint in size-bounded gzip chunks — in parallel across
+// shards and crash-safe resumable via a SQLite checkpoint. --dry-run extracts
+// and reports counts without writing to Arc.
 package main
 
 import (
@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,61 @@ var (
 	commit  = "none"
 	date    = "unknown"
 )
+
+// byteSize is a flag.Value that accepts a human-friendly size — a bare byte
+// count (e.g. 471859200) or a suffixed value (KB/MB/GB or KiB/MiB/GiB, and the
+// short K/M/G). All suffixes are treated as binary (1 MB = 1024*1024), matching
+// how the chunk limit is reasoned about (MiB). This lets the docs and operators
+// write --chunk-bytes 450MB instead of a raw byte count.
+type byteSize int64
+
+func (b *byteSize) String() string {
+	if b == nil {
+		return "0"
+	}
+	return strconv.FormatInt(int64(*b), 10)
+}
+
+func (b *byteSize) Set(s string) error {
+	n, err := parseByteSize(s)
+	if err != nil {
+		return err
+	}
+	*b = byteSize(n)
+	return nil
+}
+
+func parseByteSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+	mult := int64(1)
+	upper := strings.ToUpper(s)
+	// order matters: check longer suffixes first
+	for _, sfx := range []struct {
+		s string
+		m int64
+	}{
+		{"KIB", 1 << 10}, {"MIB", 1 << 20}, {"GIB", 1 << 30},
+		{"KB", 1 << 10}, {"MB", 1 << 20}, {"GB", 1 << 30},
+		{"K", 1 << 10}, {"M", 1 << 20}, {"G", 1 << 30}, {"B", 1},
+	} {
+		if strings.HasSuffix(upper, sfx.s) {
+			mult = sfx.m
+			s = strings.TrimSpace(s[:len(s)-len(sfx.s)])
+			break
+		}
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size %q (use bytes or a suffix like 450MB)", s)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("size must be non-negative")
+	}
+	return n * mult, nil
+}
 
 type multiFlag []string
 
@@ -49,19 +105,22 @@ func main() {
 		startStr     = flag.String("start", "", "only points >= this RFC3339 UTC time (filter)")
 		endStr       = flag.String("end", "", "only points <= this RFC3339 UTC time (filter)")
 		precision    = flag.String("precision", "ns", "LP timestamp precision: ns|us|ms|s")
-		chunkBytes   = flag.Int("chunk-bytes", chunk.DefaultMaxBytes, "max raw LP bytes per chunk (<500MB)")
 		checkpointDB = flag.String("checkpoint", "tsm2arc.checkpoint.db", "SQLite resume store path")
 		workers      = flag.Int("workers", 2, "concurrent shards to migrate (each holds ~chunk-bytes; Arc buffers each server-side)")
 		dryRun       = flag.Bool("dry-run", false, "extract + count, do not write to Arc")
 		sampleN      = flag.Int("sample", 5, "print up to N sample LP lines per database (dry-run)")
 		verbose      = flag.Bool("verbose", false, "verbose per-shard/chunk logging")
-		inclInternal = flag.Bool("include-internal", false, "include InfluxDB's _internal monitoring database")
+		inclInternal = flag.Bool("include-internal", false, "include InfluxDB 1.x's _internal database (2.x system buckets are always skipped)")
 		showVersion  = flag.Bool("version", false, "print version and exit")
 		dbFilterArg  multiFlag
 		dbMapArg     multiFlag
 	)
-	flag.Var(&dbFilterArg, "database-filter", "only migrate this source database (repeatable)")
-	flag.Var(&dbMapArg, "db-map", "rename source DB to Arc DB, form old=new (repeatable)")
+	// chunk-bytes accepts a byte count or a size suffix (e.g. 450MB); default is
+	// DefaultMaxBytes (450 MiB).
+	chunkBytes := byteSize(chunk.DefaultMaxBytes)
+	flag.Var(&chunkBytes, "chunk-bytes", "max raw LP per import request, bytes or suffixed e.g. 450MB (must be < 500MB)")
+	flag.Var(&dbFilterArg, "database-filter", "only migrate this source database/bucket (repeatable)")
+	flag.Var(&dbMapArg, "db-map", "rename source DB/bucket to Arc DB, form old=new (repeatable)")
 	flag.Parse()
 
 	if *showVersion {
@@ -80,7 +139,7 @@ func main() {
 			fatal("--token (or ARC_TOKEN) is required (or use --dry-run)")
 		}
 	}
-	if *chunkBytes >= 500*1024*1024 {
+	if int(chunkBytes) >= 500*1024*1024 {
 		fatal("--chunk-bytes must be < 500MB (Arc import cap is on decompressed bytes)")
 	}
 	if *precision != "ns" && *precision != "us" && *precision != "ms" && *precision != "s" {
@@ -207,7 +266,7 @@ func main() {
 		shards:    shards,
 		start:     start,
 		end:       end,
-		chunkSize: *chunkBytes,
+		chunkSize: int(chunkBytes),
 		dbMap:     dbMap,
 		verbose:   *verbose,
 		workers:   *workers,

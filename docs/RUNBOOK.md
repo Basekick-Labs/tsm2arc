@@ -1,8 +1,9 @@
 # tsm2arc Migration Runbook
 
-Operator guide for migrating InfluxDB 1.7/1.8 data into Arc with `tsm2arc`.
-This covers the common case: **terabytes of InfluxDB data on a cold/unmounted
-volume** (e.g. an EBS snapshot) that is not served by any running `influxd`.
+Operator guide for migrating InfluxDB **1.x (1.7/1.8) and 2.x (2.0–2.7)** data
+into Arc with `tsm2arc`. This covers the common case: **terabytes of InfluxDB
+data on a cold/unmounted volume** (e.g. an EBS snapshot) that is not served by
+any running `influxd`.
 
 > Read [DESIGN.md](DESIGN.md) for *why* the tool works the way it does. This
 > runbook is the *how*.
@@ -12,8 +13,8 @@ volume** (e.g. an EBS snapshot) that is not served by any running `influxd`.
 ## 0. Before you start — checklist
 
 - [ ] The InfluxDB data volume is mounted **read-only** on the migration host.
-- [ ] You know the path to the `data` directory (`.../influxdb/data`) and the
-      `wal` directory (`.../influxdb/wal`).
+- [ ] You know the InfluxDB root/data path (1.x: `.../influxdb` or `.../data`;
+      2.x: the v2 root containing `engine/` and `influxd.bolt`).
 - [ ] You have an **admin-tier** Arc API token (the import endpoint requires admin).
 - [ ] You know the Arc base URL and that the network path to it is open.
 - [ ] You have disk space for the SQLite checkpoint file (tiny — KB/MB).
@@ -261,12 +262,14 @@ check the `--verbose` log for `WARN`/`skipped-keys` and any shard that errored.
 
 | Symptom | Likely cause | Action |
 |---|---|---|
-| `no shards with .tsm files found` | data is WAL-only and `--waldir` omitted, or wrong `--datadir` | pass `--waldir`; verify the path points at `.../data` |
-| A database is missing from output | WAL-only + no `--waldir`, or filtered out | add `--waldir`; check `--database-filter` |
+| `no shards with TSM/WAL data found` | data is WAL-only and `--waldir` omitted, or wrong `--datadir` | pass `--waldir` (auto for 2.x); point `--datadir` at the InfluxDB root or data dir |
+| A database/bucket is missing from output | WAL-only + no `--waldir`, filtered out, or (2.x) a system bucket | add `--waldir`; check `--database-filter`; confirm it isn't a system bucket |
+| 2.x buckets show as 16-hex IDs | `influxd.bolt` missing/unreadable | provide `--bolt` or copy `influxd.bolt` next to `engine/` |
 | `arc 401` / permanent error | token not admin-tier or wrong | use an admin token |
 | `arc 413` | `--chunk-bytes` too large for Arc's cap | keep `--chunk-bytes` < 500MB (default 450MB is safe) |
 | Repeated `arc 429` then backoff | Arc under load / too many workers | lower `--workers` and/or `--chunk-bytes` |
 | Arc node OOM | `--workers` too high for Arc's RAM | lower `--workers`; see §4 memory math |
+| `checkpoint was created with different settings` | resuming with a changed `--chunk-bytes`/`--start`/`--end`/`--db-map`/`--precision` | restore the original flags, or use a fresh `--checkpoint` (full re-migration) |
 | Run aborts on a corrupt TSM file | damaged source file | note the file from the error; consider `--database-filter`/`--start`/`--end` to skip the affected shard's range, then handle it separately |
 | Resume re-sends everything | wrong/missing `--checkpoint` path | always point `--checkpoint` at the same durable file |
 
@@ -286,7 +289,7 @@ tsm2arc \
   --db-map old=new      rename source DB → Arc DB (repeatable)
   --database-filter DB  migrate only this source DB (repeatable)
   --start / --end       RFC3339 UTC time filters
-  --precision ns|us|ms|s  source timestamp precision (default ns)
+  --precision ns|us|ms|s  precision sent to Arc (default ns; tsm2arc always emits ns)
   --include-internal    also migrate InfluxDB's _internal DB
   --dry-run             extract + count, do not write to Arc
   --sample N            print N sample LP lines/DB in dry-run

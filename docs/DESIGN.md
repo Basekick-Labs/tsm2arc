@@ -98,7 +98,7 @@ Timestamps and values are independently compressed. Encodings to support:
 - **Boolean**: bit-packed.
 - **String**: Snappy-compressed length-prefixed.
 
-These codecs are stable across all of InfluxDB 1.x. They are the highest-risk part of the build (correctness of bit-level decoders) and the primary reason the **vertical-slice validation** (next phase) reads a real customer-representative TSM file and round-trips it.
+These codecs are stable across all of InfluxDB 1.x and 2.x. They are the highest-risk part (correctness of bit-level decoders), so they are validated against the real InfluxDB 1.7.11 encoder as a test-only oracle (`internal/tsm/decode_test.go`, `file_test.go`) and cross-checked against real InfluxDB 2.7 data.
 
 ### WAL file format
 Sequence of entries: `type (1B) | len (4B, big-endian) | snappy-compressed payload`. (There is no per-entry CRC field in the segment framing — matching InfluxDB's `WALSegmentReader`.) Write-type entries (`0x01`) contain values keyed by series+field, same key scheme as TSM, stored **raw** (8-byte timestamp + raw value, not the TSM block codecs). Delete (`0x02`) / DeleteRange (`0x03`) entries are tombstones and skipped. We decode write entries and feed them through the same field-rejoin path. A truncated final entry (an unclean WAL) is tolerated — we stop cleanly with everything decoded so far.
@@ -198,10 +198,9 @@ Each import request makes Arc `io.ReadAll` the (≤450 MB) decompressed file int
 Each worker holds one ~450 MB raw buffer + gzip buffer. `W × ~600 MB`. Plus TSM block decode scratch. Modest; the host is not the bottleneck.
 
 ### Backpressure & retry (sink)
-- **429 / 5xx**: exponential backoff with jitter, capped retries (e.g. 6 attempts, 1s→60s). 429 specifically means Arc is shedding load → back off harder.
-- **413 (entity too large)**: a bug in our sizing — fail hard, dump the chunk to disk for inspection. Should never happen given the 450 MB cap, but we assert it.
-- **4xx other than 429/413**: fail the shard, record the error, dump the offending chunk. Do not retry (it's a data/format problem, not transient).
-- **Network errors / timeouts**: treat as transient, backoff+retry. Use a tuned `http.Client` with sane timeouts, NOT `http.DefaultClient`.
+- **429 / 5xx**: exponential backoff with full jitter, capped retries (6 attempts, 1s→60s). 429 means Arc is shedding load.
+- **4xx other than 429** (incl. 413): permanent — the run aborts with the Arc status and a snippet of the response body. Should never hit 413 given the <500 MB cap. (The failed chunk is not written to disk; the error identifies the shard and chunk seq, and resume re-derives it.)
+- **Network errors / timeouts**: treated as transient, backoff+retry. Uses a tuned `http.Client` with sane timeouts, NOT `http.DefaultClient`.
 
 ---
 
@@ -215,30 +214,35 @@ For tagless measurements where a clean count is required, the operator can trigg
 
 ---
 
-## 9. CLI surface (draft)
+## 9. CLI surface
 
 ```
 tsm2arc \
-  --datadir   /mnt/ebs/influxdb/data     # required
-  --waldir    /mnt/ebs/influxdb/wal      # optional but recommended
-  --arc-url   https://arc.example.net   # required
-  --token     $ARC_ADMIN_TOKEN           # required (admin tier); or ARC_TOKEN env
-  --database-filter <influx-db>          # optional: migrate only this source DB (repeatable)
-  --db-map old=new                       # optional: rename source DB → Arc db (repeatable; default identity)
-  --retention-filter <rp>                # optional: only one RP
-  --start 1989-12-12T00:00:00Z           # optional time FILTER (RFC3339, UTC) — skips out-of-range points
-  --end   2024-06-01T00:00:00Z           # optional time FILTER
-  --precision ns                         # source precision (default ns)
-  --workers 2                            # concurrent shards (default 2; configurable, no cap — see §7)
-  --chunk-bytes 450MB                    # raw LP flush threshold (default 450MB)
-  --checkpoint ./tsm2arc.checkpoint.db   # SQLite resume store
-  --dry-run                              # extract + chunk + count, do NOT POST
+  --datadir   /var/lib/influxdb           # required: InfluxDB root or data dir (1.x or 2.x, auto-detected)
+  --waldir    /var/lib/influxdb/wal       # optional; auto-detected for 2.x (engine/wal)
+  --bolt      /var/lib/influxdb2/influxd.bolt  # optional (2.x): bucket-id→name map; auto-detected
+  --arc-url   https://arc.example.net     # required (unless --dry-run)
+  --token     $ARC_ADMIN_TOKEN            # required (admin tier); or ARC_TOKEN env
+  --database-filter <db|bucket>           # optional: migrate only this source DB/bucket (repeatable)
+  --db-map old=new                        # optional: rename source DB/bucket → Arc db (repeatable; default identity)
+  --start 1959-12-16T00:00:00Z            # optional time FILTER (RFC3339, UTC) — skips out-of-range points
+  --end   2024-06-01T00:00:00Z            # optional time FILTER
+  --precision ns                          # value sent to Arc's import endpoint (default ns; see note)
+  --workers 2                             # concurrent shards (default 2; configurable, no cap — see §7)
+  --chunk-bytes 450MB                     # raw LP flush threshold; bytes or a size suffix (default 450MB, must be <500MB)
+  --checkpoint ./tsm2arc.checkpoint.db    # SQLite resume store
+  --include-internal                      # also migrate 1.x's _internal database
+  --dry-run                               # extract + chunk + count, do NOT POST
+  --sample N                              # print N sample LP lines per DB in --dry-run
   --verbose
+  --version
 ```
 
-- **No `--db` flag.** Target Arc database = source InfluxDB database name (passthrough), routed per-request via the `x-arc-database` header. Use `--db-map` only to rename.
-- `--start/--end` are **filters**, not partition controls. Arc partitions by data timestamp automatically; a 1989 point creates a 1989 partition with no special handling.
-- `--dry-run` validates TSM parsing and chunk sizing against real data **without writing to Arc** — the safe first contact with customer data.
+- **No `--db` flag.** Target Arc database = source InfluxDB database/bucket name (passthrough), routed per-request via the `x-arc-database` header. Use `--db-map` only to rename. (1.x: db name; 2.x: bucket name resolved from `influxd.bolt`, falling back to the bucket ID.)
+- `--start/--end` are **filters**, not partition controls. Arc partitions by data timestamp automatically; a pre-epoch point creates a pre-epoch partition with no special handling.
+- `--precision` is the precision value forwarded to Arc's import endpoint. tsm2arc always emits **nanosecond** integer timestamps (TSM/WAL store ns), so this should normally stay `ns`.
+- `--dry-run` validates TSM/WAL parsing and chunk sizing against real data **without writing to Arc** — the safe first contact with the source data.
+- Resume requires the same chunk-shaping flags (`--chunk-bytes`, `--start`, `--end`, `--db-map`, `--precision`) as the run that created the checkpoint; tsm2arc refuses a resume with a different fingerprint (see §6).
 - All timestamps in logs, checkpoints, and bounds are **UTC**.
 
 ---
@@ -256,20 +260,24 @@ tsm2arc \
 
 ---
 
-## 11. Build phases (after this doc is approved)
+## 11. Build history (all complete)
 
-0. **Local InfluxDB 1.7/1.8 fixture**: stand up InfluxDB in a container on this machine, write known data (multi-field points, tagless measurement, multiple databases, a pre-epoch/1989 timestamp, all field types), flush to TSM. This is the validation oracle — we know exactly what went in, so we assert exact values out.
-1. **Vertical slice**: TSM reader (one file) → field-rejoin → LP encode → `--dry-run` count + value assertions against the phase-0 fixture. *This de-risks the bit-level codecs before anything else.*
-2. **Sink + chunking + per-DB routing**: gzip multipart POST to a local Arc, 450 MB chunker, `x-arc-database` per source DB, retry/backoff. Verify a 1989 point lands in the 1989 Arc partition.
-3. **Checkpoint + resume**: SQLite store keyed on `(sourceDB, shard, chunkSeq)`, deterministic boundaries, skip-on-resume, crash test (kill mid-chunk, resume, confirm no gap).
-4. **WAL reader**: decode `.wal`, merge into the same field-rejoin path.
-5. **Parallelism + discovery + progress**: shard work queue (across all source DBs), bounded `--workers`, reporting.
-6. **Runbook + verification**: operator doc, count-reconciliation helper (extracted-count vs Arc `count(*)` per measurement).
+The tool was built in phases, all shipped:
+
+0. **Local InfluxDB fixture** (`fixture/`): InfluxDB 1.8 and 2.7 containers seeded with known data (multi-field points, tagless measurement, multiple databases/buckets, a pre-epoch 1959 timestamp, all field types), flushed to TSM. The validation oracle — known input, asserted output.
+1. **Extraction**: TSM reader → field-rejoin → LP encode → `--dry-run` with value assertions against the fixture. Codecs validated against the real InfluxDB encoder.
+2. **Sink + chunking + per-DB routing**: gzip multipart POST to Arc, byte-bounded chunker, `x-arc-database` per source DB/bucket, retry/backoff.
+3. **Checkpoint + resume**: SQLite store keyed on stable `(SourceID, shardID)`, deterministic boundaries, skip-on-resume, config-fingerprint guard.
+4. **WAL reader**: decode `.wal`, merge into the same field-rejoin path (last-write-wins).
+5. **Parallelism + progress**: bounded `--workers` across shards, live throughput reporting.
+6. **InfluxDB 2.x**: layout auto-detection + bucket-id→name resolution from `influxd.bolt`.
+
+(The numbered phases below in "Resolved decisions" record the design choices made before the build.)
 
 ---
 
 ## Resolved decisions (2026-06-26)
 1. **Worker count** — fully configurable via `--workers` (no hard cap). Customer will provision a large dedicated host for the migration, so the binding constraint is the **Arc node's** RAM (each in-flight chunk buffers ~450 MB + parsed records server-side). Default stays modest (`2`) for safety; operator raises it deliberately against the Arc node's headroom. Runbook states the `W × ~1–1.3 GB` server-side math.
 2. **Mapping = InfluxDB database → Arc database (namespace), passthrough.** Arc databases and measurements are just namespaces/folders — writing to a database name creates it. So: **source InfluxDB database name → Arc `db` parameter** (per request via `x-arc-database`), and **source measurement name → Arc measurement** unchanged. There is NO single global `--db`. The tool iterates source databases discovered under `<datadir>/data/<db>/...` and routes each shard's chunks to the matching Arc database. `--db-map old=new` is an optional override for renaming; default is identity.
-3. **Time ordering = respect data time exactly.** Arc partitions by the **data timestamp** (`{db}/{measurement}/{year}/{month}/{day}/{hour}/`), identical to live ingestion. A 1989-12-12T00:00:00Z point lands in the 1989 partition. The tool does nothing special — it emits LP with the original nanosecond timestamp and Arc's normal ingest path files it by data time. `--start/--end` remain as optional *filters* (skip out-of-range points), NOT as a partitioning mechanism. Pre-epoch timestamps are supported (Arc's groupByHour handles pre-1970 via floor-division, #312).
-4. **Sample data = self-host.** Build the tool, then stand up InfluxDB 1.7/1.8 in a container on this machine, write known data, and validate extraction end-to-end. Phase 1 (vertical slice) gets validated against this local InfluxDB instead of (or in addition to) a customer file. **Bonus: we control the input, so we can assert exact extracted values against what we wrote** — stronger than a blind customer-file round-trip.
+3. **Time ordering = respect data time exactly.** Arc partitions by the **data timestamp** (`{db}/{measurement}/{year}/{month}/{day}/{hour}/`), identical to live ingestion. A pre-epoch point (e.g. 1959-12-16T00:00:00Z) lands in the matching pre-1970 partition. The tool does nothing special — it emits LP with the original nanosecond timestamp and Arc's normal ingest path files it by data time. `--start/--end` remain as optional *filters* (skip out-of-range points), NOT as a partitioning mechanism. Pre-epoch (negative-nanosecond) timestamps are supported end to end.
+4. **Sample data = self-host.** Validation runs against self-hosted InfluxDB 1.8 and 2.7 containers (`fixture/`) with known seeded data, so extraction is asserted value-by-value against what was written — stronger than a blind customer-file round-trip.

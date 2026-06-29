@@ -11,7 +11,7 @@ Migrate **InfluxDB 1.x (1.7/1.8) and 2.x (2.0–2.7)** data into
 
 The on-disk TSM/WAL format is the same across 1.x and 2.x; tsm2arc auto-detects
 the layout. For 2.x it resolves bucket IDs to readable names from `influxd.bolt`
-and skips the `_monitoring`/`_tasks` system buckets.
+and skips InfluxDB's internal system buckets (e.g. `_monitoring`, `_tasks`).
 
 Built for the case where InfluxDB data sits on cold/unmounted volumes (e.g. EBS
 snapshots) that can be mounted read-only but are not served by any InfluxDB
@@ -43,20 +43,21 @@ multi-arch (linux amd64/arm64) on GHCR.
 
 ## Status
 
-**Feature-complete: all phases shipped.**
+**Feature-complete.** Capabilities:
 
-| Phase | What | State |
-|---|---|---|
-| 0 | InfluxDB 1.8 fixture (compose + seed) | ✅ |
-| 1 | Native TSM reader + field-rejoin + LP encode + `--dry-run` | ✅ |
-| 2 | Chunked gzip POST to Arc `/api/v1/import/lp` (per-DB routing) | ✅ |
-| 3 | SQLite checkpoint + crash-safe resume | ✅ |
-| 4 | WAL (`.wal`) reader — merged with TSM per shard | ✅ |
-| 5 | Parallel workers (`--workers`) + live progress reporting | ✅ |
+| Capability | State |
+|---|---|
+| Native TSM reader + field-rejoin + LP encode + `--dry-run` | ✅ |
+| Chunked gzip POST to Arc `/api/v1/import/lp` (per-DB routing) | ✅ |
+| SQLite checkpoint + crash-safe resume | ✅ |
+| WAL (`.wal`) reader — merged with TSM per shard | ✅ |
+| Parallel workers (`--workers`) + live progress reporting | ✅ |
+| InfluxDB **2.x** layout auto-detection + bucket-name resolution | ✅ |
 
-The TSM codecs (timestamp, float, integer, unsigned, boolean, string) are
-validated against the **real InfluxDB 1.7.11 encoder** in unit tests — see
-`internal/tsm/decode_test.go` and `file_test.go`.
+The TSM/WAL codecs (timestamp, float, integer, unsigned, boolean, string) are
+validated against the **real InfluxDB 1.7.11 encoder** in unit tests
+(`internal/tsm/decode_test.go`, `file_test.go`, `internal/wal/wal_test.go`) and
+cross-checked against real InfluxDB 2.7 data.
 
 ## Quick start (dry-run)
 
@@ -101,10 +102,11 @@ natural root and it resolves the rest:
 #   --workers N              concurrent shards to migrate (default 2)
 #   --db-map old=new         rename a source DB/bucket to a different Arc DB (repeatable)
 #   --database-filter db     migrate only this source DB/bucket (repeatable)
-#   --chunk-bytes N          raw-LP bytes per import request, <500MB (default 450MB)
+#   --chunk-bytes SIZE       raw-LP per import request; bytes or a suffix like
+#                            450MB (must be <500MB; default 450MB)
 #   --checkpoint PATH        SQLite resume store (default tsm2arc.checkpoint.db)
 #   --start / --end          RFC3339 UTC time filters
-#   --precision ns|us|ms|s   source timestamp precision (default ns)
+#   --precision ns|us|ms|s   precision value sent to Arc (default ns; tsm2arc always emits ns)
 #   --include-internal       also migrate InfluxDB 1.x's _internal database
 #                            (2.x system buckets _monitoring/_tasks are always skipped)
 #   --dry-run                extract + count, do not write to Arc
@@ -152,10 +154,11 @@ are permanent and abort the run.
 
 ### Crash-safe resume
 
-A load is **resumable**. Progress is tracked per `(source database, shard)` in a
-SQLite checkpoint file (`--checkpoint`, default `tsm2arc.checkpoint.db`). Each
-chunk's progress is committed only **after** Arc returns 2xx (and Arc's import
-handler flushes to storage before returning, so 2xx means durably persisted).
+A load is **resumable**. Progress is tracked per shard — keyed on the stable
+source ID (1.x database name / 2.x bucket ID) — in a SQLite checkpoint file
+(`--checkpoint`, default `tsm2arc.checkpoint.db`). Each chunk's progress is
+committed only **after** Arc returns 2xx (and Arc's import handler flushes to
+storage before returning, so 2xx means durably persisted).
 
 If a migration is interrupted — process killed, network drop, host reboot — just
 **re-run the exact same command**. tsm2arc:
@@ -176,6 +179,12 @@ duplicates.
 > The checkpoint file is safe to keep between runs and is how resume works — keep
 > it alongside the migration. Delete it only to force a full re-migration from
 > scratch.
+
+**Resume requires the same shaping flags.** The checkpoint records a fingerprint
+of `--chunk-bytes`, `--start`, `--end`, `--db-map`, and `--precision`. Resuming
+with any of these changed would misalign chunk boundaries, so tsm2arc **refuses**
+it with a clear error rather than corrupting the migration. To change a shaping
+flag, start a fresh `--checkpoint` (a full re-migration).
 
 ## Validate against a local InfluxDB
 
