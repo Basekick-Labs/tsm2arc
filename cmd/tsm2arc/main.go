@@ -41,7 +41,7 @@ func (m *multiFlag) Set(v string) error {
 
 func main() {
 	var (
-		datadir      = flag.String("datadir", "", "InfluxDB data directory (…/data) [required]")
+		datadir      = flag.String("datadir", "", "InfluxDB root or data dir [required]; 1.x: <root> or <root>/data, 2.x: <root> or <root>/engine/data (auto-detected)")
 		waldir       = flag.String("waldir", "", "InfluxDB WAL directory [optional; auto-detected for 2.x]")
 		boltFile     = flag.String("bolt", "", "InfluxDB 2.x influxd.bolt path for bucket names [optional; auto-detected]")
 		arcURL       = flag.String("arc-url", "", "Arc base URL (e.g. https://arc.example.net) [required unless --dry-run]")

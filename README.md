@@ -99,12 +99,18 @@ natural root and it resolves the rest:
 #                            (auto-detected for 2.x as engine/wal)
 #   --bolt PATH              InfluxDB 2.x influxd.bolt for bucket names (auto-detected)
 #   --workers N              concurrent shards to migrate (default 2)
-#   --db-map old=new        rename a source DB to a different Arc DB (repeatable)
-#   --database-filter db     migrate only this source DB (repeatable)
-#   --chunk-bytes 450MB      raw-LP bytes per import request (must be <500MB)
+#   --db-map old=new         rename a source DB/bucket to a different Arc DB (repeatable)
+#   --database-filter db     migrate only this source DB/bucket (repeatable)
+#   --chunk-bytes N          raw-LP bytes per import request, <500MB (default 450MB)
 #   --checkpoint PATH        SQLite resume store (default tsm2arc.checkpoint.db)
-#   --start/--end            RFC3339 UTC time filters
-#   --include-internal       also migrate InfluxDB's _internal database
+#   --start / --end          RFC3339 UTC time filters
+#   --precision ns|us|ms|s   source timestamp precision (default ns)
+#   --include-internal       also migrate InfluxDB 1.x's _internal database
+#                            (2.x system buckets _monitoring/_tasks are always skipped)
+#   --dry-run                extract + count, do not write to Arc
+#   --sample N               print N sample LP lines per DB in --dry-run (default 5)
+#   --verbose                per-shard / per-chunk logging
+#   --version                print version and exit
 ```
 
 ### Parallelism and the `--workers` knob
