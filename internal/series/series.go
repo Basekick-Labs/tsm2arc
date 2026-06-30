@@ -47,6 +47,14 @@ func ParseKey(raw string) (Key, error) {
 	}, nil
 }
 
+// ParseSeriesKey parses a bare series key (the "measurement,tagk=tagv,..." part
+// with no field separator) into its measurement and ordered tags. Use this when
+// you already have a grouped series key and need its measurement/tags without a
+// field.
+func ParseSeriesKey(seriesKey string) (measurement string, tags [][2]string) {
+	return splitSeries(seriesKey)
+}
+
 // splitSeries splits "measurement,tagk=tagv,..." honoring backslash escapes for
 // commas and equals signs (line-protocol style). Tag order is preserved.
 func splitSeries(s string) (string, [][2]string) {
