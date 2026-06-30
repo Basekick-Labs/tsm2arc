@@ -163,6 +163,22 @@ Guidance:
 You can also lower `--chunk-bytes` to reduce per-request memory (e.g.
 `--chunk-bytes 200MB`), at the cost of more requests.
 
+### Migration-host memory
+
+Separately from the Arc node, watch the **migration host's** own RAM:
+
+- **Extraction (`--dry-run` and the read side of a load)** streams one series at
+  a time, so it is near-constant memory — bounded by the largest single *series*,
+  not the shard. Even multi-GB shards extract in tens of MB.
+- **The load adds the chunk buffer**: each worker holds up to `--chunk-bytes` of
+  raw line protocol before flushing, so the host uses roughly
+  `workers × chunk-bytes` (e.g. `4 × 450 MB ≈ 1.8 GB`). If the host is memory
+  constrained, lower `--chunk-bytes` and/or `--workers` — neither affects
+  correctness or resume.
+
+(If a `--dry-run` ever uses memory proportional to the *dataset* rather than tens
+of MB, you're on a pre-0.1.2 binary — upgrade.)
+
 ---
 
 ## 5. Run the migration
@@ -219,32 +235,48 @@ re-sent).
 
 ---
 
-## 7. Verify
+## 7. Verify (the trust gate — don't skip)
 
-After the run completes (`DONE: imported N rows ...`):
+Count reconciliation is how you know the migration is complete and correct.
+After the run finishes (`DONE: imported N rows ...`):
+
+**1. Extracted-vs-Arc row counts.**
 
 ```bash
-# 1. Compare extracted counts vs Arc, per database/measurement.
-#    Extracted count (tool side): re-run dry-run and read the totals.
-tsm2arc --datadir /mnt/influx/data --waldir /mnt/influx/wal --dry-run --sample 0
+# Tool side — re-run --dry-run with the SAME flags (incl. any --waldir / --start
+# / --end) and read the per-database totals. Using the same flags matters: the
+# extracted count must be measured over the same scope you migrated.
+tsm2arc --datadir <same> [--waldir <same>] [--start <same> --end <same>] --dry-run --sample 0
 
-#    Arc side: query row counts per measurement (example).
+# Arc side — count rows per measurement. If you migrated with --start/--end,
+# add the SAME time bounds to the query so both sides cover the same window.
 curl -s -H "Authorization: Bearer $ARC_TOKEN" \
   "https://arc.example.net/api/v1/query" \
-  --data-urlencode 'q=SELECT count(*) FROM <measurement>' --data-urlencode 'db=<database>'
+  --data-urlencode "q=SELECT count(*) FROM <measurement> WHERE time >= '<start>' AND time <= '<end>'" \
+  --data-urlencode 'db=<database>'
 ```
 
-- For **tag-bearing** data after Arc compaction runs, counts should match exactly.
-- For **tagless** data, a small positive delta on Arc's side = resume-overlap
-  duplicates (bounded per §6); a clean run shows no delta.
+- **Tag-bearing** data: after Arc compaction runs, counts should match exactly.
+- **Tagless** data: a small positive delta on Arc's side = resume-overlap
+  duplicates (bounded to ≤1 chunk per shard per crash, per §6); a clean,
+  uninterrupted run shows no delta.
+- **A short count on Arc's side** (fewer rows than extracted) is the signal to
+  investigate — that's data that didn't land. Check the `--verbose` log for
+  `WARN` lines, non-zero `skipped-keys`, or any shard that errored, then resume
+  (re-run the same command — it continues where it left off).
+
+**2. WAL coverage check.** If you did **not** pass `--waldir`, confirm there's no
+meaningful un-flushed data you skipped:
 
 ```bash
-# 2. Spot-check a few series' min/max time and sampled values against the
-#    dry-run sample lines from step 2.
+find <waldir> -name '*.wal' -size +0c    # non-empty WAL segments = un-migrated data
 ```
 
-If counts are far off (not a small overlap), investigate before declaring done —
-check the `--verbose` log for `WARN`/`skipped-keys` and any shard that errored.
+If that finds non-empty segments, re-run **with** `--waldir` (the same checkpoint
+will skip everything already done and add only the WAL-resident data).
+
+**3. Spot-check** a few series' min/max time and sampled values against the
+`--dry-run` sample lines from step 2.
 
 ---
 

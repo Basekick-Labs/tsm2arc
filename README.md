@@ -130,6 +130,26 @@ conservative; raise it deliberately if the Arc node has headroom (the customer's
 big dedicated migration host is rarely the bottleneck — Arc is). Resume and
 correctness are unaffected by the worker count.
 
+### Memory profile
+
+tsm2arc extracts by **streaming one series at a time** — it indexes only the TSM
+key list up front, then reads, emits, and frees each series' values in turn. So
+on the **migration host**:
+
+- **Extraction / `--dry-run`** is near-constant memory, bounded by the largest
+  single *series*, not the shard or dataset. A multi-GB shard extracts in tens of
+  MB. (Earlier versions held a whole shard's decoded values at once — a 36 MB
+  shard could cost ~2.7 GB RSS; v0.1.2+ does the same in ~27 MB.)
+- **Load** adds the chunk buffer: each worker accumulates up to `--chunk-bytes`
+  of raw line protocol before flushing, so migration-host RAM is roughly
+  `workers × chunk-bytes` (e.g. `4 × 450 MB ≈ 1.8 GB`). Lower `--chunk-bytes`
+  and/or `--workers` to reduce it; both are safe to change (resume/correctness
+  are unaffected).
+
+On the **Arc node**, each in-flight import is buffered server-side (~`chunk-bytes`
+decompressed + parsed records), so its peak is `workers × ~1–1.3 GB` — usually
+the binding constraint (see above).
+
 ### Always pass `--waldir`
 
 InfluxDB does **not** flush the write-ahead log to TSM on shutdown — small or
