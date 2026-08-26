@@ -53,6 +53,7 @@ multi-arch (linux amd64/arm64) on GHCR.
 | WAL (`.wal`) reader — merged with TSM per shard | ✅ |
 | Parallel workers (`--workers`) + live progress reporting | ✅ |
 | InfluxDB **2.x** layout auto-detection + bucket-name resolution | ✅ |
+| Measurement rename map + invalid-name policy (`fail`/`skip`/`map`) with a checkpoint audit trail | ✅ |
 
 The TSM/WAL codecs (timestamp, float, integer, unsigned, boolean, string) are
 validated against the **real InfluxDB 1.7.11 encoder** in unit tests
@@ -102,6 +103,14 @@ natural root and it resolves the rest:
 #   --workers N              concurrent shards to migrate (default 2)
 #   --db-map old=new         rename a source DB/bucket to a different Arc DB (repeatable)
 #   --database-filter db     migrate only this source DB/bucket (repeatable)
+#   --measurement-map old=new       rename a source measurement (repeatable; new must
+#                                   satisfy Arc's name rule — see below)
+#   --measurement-map-file PATH     file of measurement renames, one old=new per line
+#                                   (blank lines and # comments ignored)
+#   --on-invalid-measurement MODE   what to do with a measurement name Arc would
+#                                   reject, after --measurement-map is applied:
+#                                   fail (default) | skip (drop + report) | map
+#                                   (deterministic auto-rename)
 #   --chunk-bytes SIZE       raw-LP per import request; bytes or a suffix like
 #                            450MB (must be <500MB; default 450MB)
 #   --checkpoint PATH        SQLite resume store (default tsm2arc.checkpoint.db)
@@ -172,6 +181,52 @@ Each source InfluxDB database is routed to the Arc database of the same name
 failures (429, 5xx, network) are retried with exponential backoff; 4xx errors
 are permanent and abort the run.
 
+### Measurement names Arc rejects (dots etc.)
+
+Arc only accepts measurement names matching `^[a-zA-Z][a-zA-Z0-9_-]*$` — the
+dot is Arc's `database.measurement` separator in the query layer and in RBAC
+grant keys, so it can't appear inside a measurement name. InfluxDB is far more
+permissive (dotted `<env>.<service>` names are common), so a 1.x/2.x dataset
+can be full of names Arc will reject with a 400.
+
+tsm2arc validates every name **client-side, before anything is sent**:
+
+- `--dry-run` lists every measurement that would be renamed, skipped, or would
+  abort a load — with point counts — before any network traffic. Start here.
+- `--measurement-map old=new` (repeatable) and `--measurement-map-file PATH`
+  (one `old=new` per line, `#` comments) rename measurements explicitly. This
+  is the recommended path: you author deterministic names traceable back to
+  source. Map targets are validated at startup; the map may also rename names
+  that are already valid.
+- `--on-invalid-measurement` controls what happens to a name that is *still*
+  invalid after the map:
+  - `fail` (default) — abort immediately with an actionable error, before the
+    point is sent. No more dying at chunk 73 on an Arc 400.
+  - `skip` — drop the measurement's points, keep loading, and report exactly
+    what was skipped (names + point counts).
+  - `map` — auto-rename deterministically: every disallowed character becomes
+    `_`, and a name not starting with a letter gets an `m_` prefix (e.g.
+    `ace-test.castle_services` → `ace-test_castle_services`). Distinct source
+    names *can* collide after sanitizing (`a.b` and `a_b` both → `a_b`), which
+    would merge those measurements — prefer an explicit map when names are
+    close together.
+
+**Nothing is silent.** Every rename (explicit or auto) and every skip is
+recorded in the checkpoint database (table `measurement_actions`: source db,
+shard, source name, final name, origin, point count) and summarized at the end
+of the run — so each rename is auditable and reversible, and skipped data is
+on record rather than quietly missing.
+
+```bash
+# preview what would happen
+tsm2arc --datadir /mnt/influx/data --waldir /mnt/influx/wal --dry-run
+
+# author renames for the dotted names it reported, then load
+tsm2arc ... \
+  --measurement-map-file renames.map \
+  --on-invalid-measurement=fail        # fail if anything is still unmapped
+```
+
 ### Crash-safe resume
 
 A load is **resumable**. Progress is tracked per shard — keyed on the stable
@@ -201,10 +256,14 @@ duplicates.
 > scratch.
 
 **Resume requires the same shaping flags.** The checkpoint records a fingerprint
-of `--chunk-bytes`, `--start`, `--end`, `--db-map`, and `--precision`. Resuming
+of `--chunk-bytes`, `--start`, `--end`, `--db-map`, `--precision`, and — when
+used — `--measurement-map`/`--measurement-map-file` and
+`--on-invalid-measurement` (renames and skips change chunk bytes). Resuming
 with any of these changed would misalign chunk boundaries, so tsm2arc **refuses**
 it with a clear error rather than corrupting the migration. To change a shaping
-flag, start a fresh `--checkpoint` (a full re-migration).
+flag, start a fresh `--checkpoint` (a full re-migration). Checkpoints created
+by tsm2arc ≤ 0.1.2 resume unchanged as long as the new flags stay at their
+defaults.
 
 ## Validate against a local InfluxDB
 

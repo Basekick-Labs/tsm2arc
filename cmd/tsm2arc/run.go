@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 
 	"golang.org/x/sync/errgroup"
@@ -12,28 +13,45 @@ import (
 	"github.com/basekick-labs/tsm2arc/internal/chunk"
 	"github.com/basekick-labs/tsm2arc/internal/discover"
 	"github.com/basekick-labs/tsm2arc/internal/extract"
+	"github.com/basekick-labs/tsm2arc/internal/measure"
 	"github.com/basekick-labs/tsm2arc/internal/sink"
 	"github.com/basekick-labs/tsm2arc/internal/tsm"
 	"github.com/basekick-labs/tsm2arc/internal/wal"
 )
 
 // runDryRun extracts and reports counts + sample LP per database, no network.
+// It also resolves every measurement name through the rename map + policy and
+// reports what a load would do — the pre-flight answer to "which of my
+// measurement names would Arc reject, and what happens to them?".
 func runDryRun(ctx context.Context, cfg runConfig, sampleN int) {
 	type dbAgg struct {
 		points, fields, keys, skipped int64
 		minT, maxT                    int64
 		hasT                          bool
 		samples                       []string
+		// source measurement → resolution + affected point count, for every
+		// measurement that is NOT a plain pass-through.
+		actions map[string]measure.Resolution
+		actPts  map[string]int64
 	}
 	aggs := map[string]*dbAgg{}
 
 	order, byDB := shardsByDB(cfg.shards)
 	for _, db := range order {
-		ag := &dbAgg{minT: math.MaxInt64, maxT: math.MinInt64}
+		ag := &dbAgg{minT: math.MaxInt64, maxT: math.MinInt64,
+			actions: map[string]measure.Resolution{}, actPts: map[string]int64{}}
 		aggs[db] = ag
 		for _, sh := range byDB[db] {
 			forEachPoint(cfg, sh, func(p extract.Point) {
-				if len(ag.samples) < sampleN {
+				res := cfg.resolver.Resolve(p.Measurement)
+				if res.Action != measure.ActionPass {
+					ag.actions[p.Measurement] = res
+					ag.actPts[p.Measurement]++
+				}
+				// Samples show what a load would SEND: renamed lines under their
+				// final name; skipped/invalid measurements never sampled.
+				if len(ag.samples) < sampleN && res.Name != "" {
+					p.Measurement = res.Name
 					ag.samples = append(ag.samples, strings.TrimRight(extract.EncodePoint(p), "\n"))
 				}
 			}, func(st extract.Stats) {
@@ -54,7 +72,7 @@ func runDryRun(ctx context.Context, cfg runConfig, sampleN int) {
 		}
 	}
 
-	var totalPoints, totalFields int64
+	var totalPoints, totalFields, totalInvalid int64
 	fmt.Println("\n=== DRY RUN SUMMARY ===")
 	for _, db := range order {
 		ag := aggs[db]
@@ -66,12 +84,42 @@ func runDryRun(ctx context.Context, cfg runConfig, sampleN int) {
 		if ag.hasT {
 			fmt.Printf("  time range: %s … %s\n", fmtNano(ag.minT), fmtNano(ag.maxT))
 		}
+		for _, m := range sortedKeys(ag.actions) {
+			res, n := ag.actions[m], ag.actPts[m]
+			switch res.Action {
+			case measure.ActionRenamed:
+				fmt.Printf("  rename: %q → %q (explicit map, %d points)\n", m, res.Name, n)
+			case measure.ActionAutoRenamed:
+				fmt.Printf("  rename: %q → %q (auto, %d points)\n", m, res.Name, n)
+			case measure.ActionSkipped:
+				fmt.Printf("  SKIP:   %q (%d points would NOT be migrated)\n", m, n)
+			case measure.ActionInvalid:
+				totalInvalid++
+				fmt.Printf("  INVALID: %q (%d points) — a load would abort on this name\n", m, n)
+			}
+		}
 		for _, s := range ag.samples {
 			fmt.Printf("    %s\n", s)
 		}
 	}
 	fmt.Printf("\nTOTAL: %d points, %d field-values across %d database(s)\n",
 		totalPoints, totalFields, len(order))
+	if totalInvalid > 0 {
+		fmt.Printf("\nWARNING: %d measurement name(s) violate Arc's rule (%s) and would abort a load.\n"+
+			"Rename them with --measurement-map old=new (or --measurement-map-file), or set\n"+
+			"--on-invalid-measurement=skip (drop + report) or =map (deterministic auto-rename).\n",
+			totalInvalid, measure.ArcNameRule)
+	}
+}
+
+// sortedKeys returns m's keys in ascending order (deterministic reporting).
+func sortedKeys(m map[string]measure.Resolution) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // runLoad extracts and pushes chunked LP to Arc with crash-safe resume.
@@ -93,6 +141,36 @@ func runLoad(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoint.
 			res.SkippedShards, res.SkippedChunks)
 	}
 	fmt.Println()
+	printMeasurementReport(cp)
+	if res.SkippedPoints > 0 {
+		fmt.Printf("\nWARNING: %d point(s) in invalid measurements were skipped and are NOT in Arc\n"+
+			"(--on-invalid-measurement=skip). The skipped names are recorded in the checkpoint\n"+
+			"and listed above; migrate them later with --measurement-map old=new.\n", res.SkippedPoints)
+	}
+}
+
+// printMeasurementReport prints the audit trail of measurement renames/skips
+// accumulated in the checkpoint (across this run AND prior resumed runs).
+func printMeasurementReport(cp *checkpoint.Store) {
+	rows, err := cp.MeasurementReport()
+	if err != nil {
+		fmt.Printf("WARN: could not read measurement action log: %v\n", err)
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Println("\nMeasurement renames/skips (recorded in the checkpoint, table measurement_actions):")
+	for _, r := range rows {
+		switch r.Action {
+		case "renamed":
+			fmt.Printf("  [%s] %q → %q (%s, %d points, %d shard(s))\n",
+				r.SourceDB, r.Measurement, r.RenamedTo, r.Origin, r.Points, r.Shards)
+		case "skipped":
+			fmt.Printf("  [%s] %q SKIPPED (%d points NOT migrated, %d shard(s))\n",
+				r.SourceDB, r.Measurement, r.Points, r.Shards)
+		}
+	}
 }
 
 // loadResult aggregates the outcome of a load pass (returned for testability).
@@ -101,6 +179,7 @@ type loadResult struct {
 	Chunks        int64
 	SkippedChunks int64
 	SkippedShards int64
+	SkippedPoints int64 // points dropped under --on-invalid-measurement=skip
 	Databases     int
 }
 
@@ -163,6 +242,7 @@ func load(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoint.Sto
 		res.Rows += sr.rows
 		res.Chunks += sr.sent
 		res.SkippedChunks += sr.skipped
+		res.SkippedPoints += sr.skippedPoints
 		if sr.alreadyDone {
 			res.SkippedShards++
 		}
@@ -173,6 +253,7 @@ func load(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoint.Sto
 
 type shardResult struct {
 	rows, sent, skipped int64
+	skippedPoints       int64
 	alreadyDone         bool
 }
 
@@ -231,10 +312,41 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 		return nil
 	})
 
+	// Measurement resolution is cached per name: shards emit points grouped by
+	// series, so the same measurement string recurs in long runs. actPts tallies
+	// affected points per source measurement for the checkpoint audit record.
+	resCache := map[string]measure.Resolution{}
+	actPts := map[string]int64{}
+
 	var appendErr error
 	_ = forEachPoint(cfg, sh, func(p extract.Point) {
 		if appendErr != nil {
 			return
+		}
+		res, ok := resCache[p.Measurement]
+		if !ok {
+			res = cfg.resolver.Resolve(p.Measurement)
+			resCache[p.Measurement] = res
+			switch res.Action {
+			case measure.ActionRenamed:
+				prog.logf("[%s/%s] renaming measurement %q → %q (explicit map)", label, sh.ShardID, p.Measurement, res.Name)
+			case measure.ActionAutoRenamed:
+				prog.logf("[%s/%s] renaming measurement %q → %q (auto)", label, sh.ShardID, p.Measurement, res.Name)
+			case measure.ActionSkipped:
+				prog.logf("[%s/%s] skipping invalid measurement %q", label, sh.ShardID, p.Measurement)
+			}
+		}
+		switch res.Action {
+		case measure.ActionInvalid:
+			appendErr = errInvalidMeasurement(p.Measurement)
+			return
+		case measure.ActionSkipped:
+			actPts[p.Measurement]++
+			r.skippedPoints++
+			return
+		case measure.ActionRenamed, measure.ActionAutoRenamed:
+			actPts[p.Measurement]++
+			p.Measurement = res.Name
 		}
 		appendErr = acc.Append(ctx, []byte(extract.EncodePoint(p)))
 	}, nil, prog)
@@ -245,6 +357,33 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 		return r, fmt.Errorf("final flush %s/%s: %w", label, sh.ShardID, err)
 	}
 
+	// Persist the shard's rename/skip audit records BEFORE marking it done, so
+	// a done shard always has its actions on record. Counts are deterministic
+	// per shard (extraction order is), so re-recording on a resume overwrites
+	// with identical values.
+	if len(actPts) > 0 {
+		acts := make([]checkpoint.MeasurementAction, 0, len(actPts))
+		for _, m := range sortedKeys(resCache) {
+			n, affected := actPts[m]
+			if !affected {
+				continue
+			}
+			a := checkpoint.MeasurementAction{Measurement: m, Points: n}
+			switch resCache[m].Action {
+			case measure.ActionSkipped:
+				a.Action = "skipped"
+			case measure.ActionRenamed:
+				a.Action, a.RenamedTo, a.Origin = "renamed", resCache[m].Name, "explicit"
+			case measure.ActionAutoRenamed:
+				a.Action, a.RenamedTo, a.Origin = "renamed", resCache[m].Name, "auto"
+			}
+			acts = append(acts, a)
+		}
+		if err := cp.RecordMeasurementActions(cpKey, sh.ShardID, acts); err != nil {
+			return r, fmt.Errorf("record measurement actions %s/%s: %w", label, sh.ShardID, err)
+		}
+	}
+
 	// All chunks for this shard acknowledged — mark it done so future resumes
 	// skip the whole shard (no re-extraction).
 	if err := cp.MarkShardDone(cpKey, sh.ShardID, acc.Seq(), r.rows); err != nil {
@@ -252,6 +391,18 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 	}
 	prog.shardDone()
 	return r, nil
+}
+
+// errInvalidMeasurement is the client-side replacement for Arc's mid-load 400:
+// it fires before anything is sent and tells the operator exactly how to
+// proceed, instead of ending a multi-hour load at chunk 73.
+func errInvalidMeasurement(name string) error {
+	return fmt.Errorf("invalid measurement name %q: Arc requires measurement names to match %s\n"+
+		"  rename it:    --measurement-map '%s=<valid-name>'  (or --measurement-map-file FILE)\n"+
+		"  skip it:      --on-invalid-measurement=skip  (drop + report; recorded in the checkpoint)\n"+
+		"  auto-rename:  --on-invalid-measurement=map   (deterministic; recorded in the checkpoint)\n"+
+		"  preview every invalid name first with --dry-run",
+		name, measure.ArcNameRule, name)
 }
 
 // openTSM adapts tsm.Open to extract.OpenTSM (returns the interface type).

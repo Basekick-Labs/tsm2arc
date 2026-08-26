@@ -231,6 +231,9 @@ tsm2arc \
   --workers 2                             # concurrent shards (default 2; configurable, no cap — see §7)
   --chunk-bytes 450MB                     # raw LP flush threshold; bytes or a size suffix (default 450MB, must be <500MB)
   --checkpoint ./tsm2arc.checkpoint.db    # SQLite resume store
+  --measurement-map old=new               # optional: rename a source measurement (repeatable; target must satisfy Arc's name rule)
+  --measurement-map-file PATH             # optional: file of measurement renames, one old=new per line (# comments)
+  --on-invalid-measurement fail|skip|map  # policy for names Arc rejects after the map (default fail; see note)
   --include-internal                      # also migrate 1.x's _internal database
   --dry-run                               # extract + chunk + count, do NOT POST
   --sample N                              # print N sample LP lines per DB in --dry-run
@@ -242,7 +245,8 @@ tsm2arc \
 - `--start/--end` are **filters**, not partition controls. Arc partitions by data timestamp automatically; a pre-epoch point creates a pre-epoch partition with no special handling.
 - `--precision` is the precision value forwarded to Arc's import endpoint. tsm2arc always emits **nanosecond** integer timestamps (TSM/WAL store ns), so this should normally stay `ns`.
 - `--dry-run` validates TSM/WAL parsing and chunk sizing against real data **without writing to Arc** — the safe first contact with the source data.
-- Resume requires the same chunk-shaping flags (`--chunk-bytes`, `--start`, `--end`, `--db-map`, `--precision`) as the run that created the checkpoint; tsm2arc refuses a resume with a different fingerprint (see §6).
+- **Measurement-name validation is client-side.** Arc only accepts measurement names matching `^[a-zA-Z][a-zA-Z0-9_-]*$` (the dot is Arc's `database.measurement` separator in the query layer and RBAC grant keys). tsm2arc validates every name before sending: `--measurement-map`/`--measurement-map-file` rename explicitly (targets validated at startup), and `--on-invalid-measurement` decides the rest — `fail` aborts before sending (default), `skip` drops-and-reports, `map` auto-sanitizes deterministically (disallowed chars → `_`, `m_` prefix when not letter-initial; distinct names can collide, hence opt-in). Every rename/skip is recorded in the checkpoint (`measurement_actions`) with per-shard point counts — counts overwrite on re-derive, so resumes never double-count.
+- Resume requires the same chunk-shaping flags (`--chunk-bytes`, `--start`, `--end`, `--db-map`, `--precision`, and — when non-default — `--measurement-map`/`--on-invalid-measurement`, since renames/skips change chunk bytes) as the run that created the checkpoint; tsm2arc refuses a resume with a different fingerprint (see §6). Default measurement settings produce the pre-0.1.3 fingerprint, so old checkpoints resume unchanged.
 - All timestamps in logs, checkpoints, and bounds are **UTC**.
 
 ---

@@ -75,6 +75,17 @@ func (s *Store) init() error {
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		);
+		CREATE TABLE IF NOT EXISTS measurement_actions (
+			source_db   TEXT NOT NULL,
+			shard_id    TEXT NOT NULL,
+			measurement TEXT NOT NULL,
+			action      TEXT NOT NULL,
+			renamed_to  TEXT NOT NULL DEFAULT '',
+			origin      TEXT NOT NULL DEFAULT '',
+			points      INTEGER NOT NULL DEFAULT 0,
+			updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+			PRIMARY KEY (source_db, shard_id, measurement)
+		);
 	`)
 	return err
 }
@@ -98,7 +109,8 @@ func (s *Store) CheckConfig(fingerprint string) error {
 	}
 	if existing != fingerprint {
 		return fmt.Errorf("checkpoint was created with different settings (%s) than this run (%s); "+
-			"resume requires identical --chunk-bytes/--start/--end/--db-map. "+
+			"resume requires identical --chunk-bytes/--start/--end/--db-map/--precision/"+
+			"--measurement-map/--on-invalid-measurement. "+
 			"Use a fresh --checkpoint path or restore the original flags", existing, fingerprint)
 	}
 	return nil
@@ -168,6 +180,85 @@ func (s *Store) MarkShardDone(sourceDB, shardID string, totalChunks int, rowsSen
 			finished_at  = excluded.finished_at
 	`, sourceDB, shardID, totalChunks, rowsSent)
 	return err
+}
+
+// MeasurementAction is one durable record of a measurement-name policy
+// decision applied within one shard: a rename (explicit map or auto-sanitize)
+// or a skip. This is the audit trail promised by --measurement-map /
+// --on-invalid-measurement — every rename is traceable back to its source
+// name and every skip is on record with its point count.
+type MeasurementAction struct {
+	Measurement string // source measurement name
+	Action      string // "renamed" or "skipped"
+	RenamedTo   string // final Arc name (renames only)
+	Origin      string // "explicit" or "auto" (renames only)
+	Points      int64  // points affected in this shard
+}
+
+// RecordMeasurementActions upserts a shard's measurement actions in one
+// transaction. Point counts OVERWRITE on conflict: shard extraction is
+// deterministic, so a re-derived shard produces the same counts — overwriting
+// (rather than accumulating) keeps a resumed run from double-counting.
+func (s *Store) RecordMeasurementActions(sourceDB, shardID string, acts []MeasurementAction) error {
+	if len(acts) == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, a := range acts {
+		if _, err := tx.Exec(`
+			INSERT INTO measurement_actions (source_db, shard_id, measurement, action, renamed_to, origin, points, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+			ON CONFLICT(source_db, shard_id, measurement) DO UPDATE SET
+				action     = excluded.action,
+				renamed_to = excluded.renamed_to,
+				origin     = excluded.origin,
+				points     = excluded.points,
+				updated_at = excluded.updated_at
+		`, sourceDB, shardID, a.Measurement, a.Action, a.RenamedTo, a.Origin, a.Points); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// MeasurementReportRow aggregates one (source db, measurement) action across
+// all shards recorded so far (including prior resumed runs).
+type MeasurementReportRow struct {
+	SourceDB    string
+	Measurement string
+	Action      string
+	RenamedTo   string
+	Origin      string
+	Points      int64
+	Shards      int
+}
+
+// MeasurementReport returns the aggregated measurement action log, ordered by
+// source db, then action, then measurement — the end-of-run audit summary.
+func (s *Store) MeasurementReport() ([]MeasurementReportRow, error) {
+	rows, err := s.db.Query(`
+		SELECT source_db, measurement, action, renamed_to, origin, SUM(points), COUNT(1)
+		FROM measurement_actions
+		GROUP BY source_db, measurement, action, renamed_to, origin
+		ORDER BY source_db, action, measurement
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MeasurementReportRow
+	for rows.Next() {
+		var r MeasurementReportRow
+		if err := rows.Scan(&r.SourceDB, &r.Measurement, &r.Action, &r.RenamedTo, &r.Origin, &r.Points, &r.Shards); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // RewindForTest lowers a shard's committed_seq by 1 and clears its done mark.

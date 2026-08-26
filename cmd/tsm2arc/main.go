@@ -22,6 +22,7 @@ import (
 	"github.com/basekick-labs/tsm2arc/internal/checkpoint"
 	"github.com/basekick-labs/tsm2arc/internal/chunk"
 	"github.com/basekick-labs/tsm2arc/internal/discover"
+	"github.com/basekick-labs/tsm2arc/internal/measure"
 	"github.com/basekick-labs/tsm2arc/internal/sink"
 )
 
@@ -112,8 +113,11 @@ func main() {
 		verbose      = flag.Bool("verbose", false, "verbose per-shard/chunk logging")
 		inclInternal = flag.Bool("include-internal", false, "include InfluxDB 1.x's _internal database (2.x system buckets are always skipped)")
 		showVersion  = flag.Bool("version", false, "print version and exit")
+		onInvalid    = flag.String("on-invalid-measurement", "fail", "what to do with a measurement name Arc would reject (after --measurement-map): fail|skip|map (map = deterministic auto-rename, recorded in the checkpoint)")
+		mMapFile     = flag.String("measurement-map-file", "", "file of measurement renames, one old=new per line (#-comments and blank lines ignored)")
 		dbFilterArg  multiFlag
 		dbMapArg     multiFlag
+		mMapArg      multiFlag
 	)
 	// chunk-bytes accepts a byte count or a size suffix (e.g. 450MB); default is
 	// DefaultMaxBytes (450 MiB).
@@ -121,6 +125,7 @@ func main() {
 	flag.Var(&chunkBytes, "chunk-bytes", "max raw LP per import request, bytes or suffixed e.g. 450MB (must be < 500MB)")
 	flag.Var(&dbFilterArg, "database-filter", "only migrate this source database/bucket (repeatable)")
 	flag.Var(&dbMapArg, "db-map", "rename source DB/bucket to Arc DB, form old=new (repeatable)")
+	flag.Var(&mMapArg, "measurement-map", "rename a source measurement, form old=new; new must satisfy Arc's name rule (repeatable)")
 	flag.Parse()
 
 	if *showVersion {
@@ -166,13 +171,33 @@ func main() {
 		dbMap[parts[0]] = parts[1]
 	}
 
+	// Measurement rename map (flag entries + optional file) and invalid-name
+	// policy. Map targets are validated against Arc's rule up front so a typo
+	// fails here, not hours into the load.
+	policy, err := measure.ParsePolicy(*onInvalid)
+	if err != nil {
+		fatal("%v", err)
+	}
+	mMap := map[string]string{}
+	if err := measure.AddEntries(mMap, mMapArg, "--measurement-map"); err != nil {
+		fatal("%v", err)
+	}
+	if *mMapFile != "" {
+		if err := measure.LoadMapFile(*mMapFile, mMap); err != nil {
+			fatal("%v", err)
+		}
+	}
+	resolver, err := measure.NewResolver(mMap, policy)
+	if err != nil {
+		fatal("%v", err)
+	}
+
 	// Detect 1.x vs 2.x and resolve the actual TSM data dir. For 2.x we also
 	// auto-resolve the WAL dir (engine/wal) and load bucket-id → name from
 	// influxd.bolt so shards key on readable names.
 	resolvedData, ver := discover.Detect(*datadir)
 	wd := *waldir
 	var bucketMap *buckets.Mapping
-	var err error
 	switch ver {
 	case discover.Version2:
 		fmt.Printf("detected InfluxDB 2.x layout at %s\n", resolvedData)
@@ -268,6 +293,7 @@ func main() {
 		end:       end,
 		chunkSize: int(chunkBytes),
 		dbMap:     dbMap,
+		resolver:  resolver,
 		verbose:   *verbose,
 		workers:   *workers,
 	}
@@ -299,14 +325,21 @@ func main() {
 // configFingerprint captures the migration-shaping inputs that determine chunk
 // boundaries. Resuming with a different fingerprint is rejected (see
 // checkpoint.CheckConfig). db-map is included sorted for stable ordering.
+// The measurement map / invalid-name policy also shape chunk bytes, so they
+// are part of the fingerprint — but only when non-default, so checkpoints
+// created by tsm2arc <= 0.1.2 (which had neither flag) still resume.
 func configFingerprint(cfg runConfig, precision string) string {
 	maps := make([]string, 0, len(cfg.dbMap))
 	for k, v := range cfg.dbMap {
 		maps = append(maps, k+"="+v)
 	}
 	sort.Strings(maps)
-	return fmt.Sprintf("chunk=%d;start=%d;end=%d;precision=%s;dbmap=%s",
+	fp := fmt.Sprintf("chunk=%d;start=%d;end=%d;precision=%s;dbmap=%s",
 		cfg.chunkSize, cfg.start, cfg.end, precision, strings.Join(maps, ","))
+	if mfp := cfg.resolver.Fingerprint(); mfp != "" {
+		fp += ";" + mfp
+	}
+	return fp
 }
 
 // runConfig is the shared input for both dry-run and load.
@@ -316,6 +349,7 @@ type runConfig struct {
 	end       int64
 	chunkSize int
 	dbMap     map[string]string
+	resolver  *measure.Resolver // nil (tests) = pass-through, no validation
 	verbose   bool
 	workers   int
 }

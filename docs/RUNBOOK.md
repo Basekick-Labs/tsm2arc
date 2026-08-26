@@ -112,6 +112,11 @@ Check the output:
   are supported and will show as negative epoch / pre-1970 dates).
 - **sample line protocol** lines look correct: right measurement names, tags,
   field types (`i` integer, `u` unsigned, quoted strings, true/false booleans).
+- **`INVALID:` lines** — measurement names Arc would reject (Arc requires
+  `^[a-zA-Z][a-zA-Z0-9_-]*$`; dots in particular are not allowed). The dry run
+  lists each one with its point count so you can author renames *before* the
+  load — see §3a. A load with the default settings aborts (client-side, before
+  sending) on the first such name.
 
 If a database you expected is missing, check whether its data is WAL-only and
 whether you passed `--waldir`.
@@ -134,9 +139,60 @@ Mapping:
 
 - By default each source InfluxDB **database** maps to an Arc **database** of the
   same name (Arc databases are namespaces). Measurement names pass through
-  unchanged.
+  unchanged (but are validated — see §3a).
 - Use `--db-map old=new` to rename (repeatable), e.g.
   `--db-map telemetry=telemetry_prod`.
+
+---
+
+## 3a. Handle measurement names Arc rejects
+
+Arc accepts only measurement names matching `^[a-zA-Z][a-zA-Z0-9_-]*$` (the dot
+is Arc's `database.measurement` separator in queries and RBAC grant keys, so it
+cannot appear in a name). InfluxDB allows much more — dotted
+`<env>.<service>` names are common — and tsm2arc validates **client-side,
+before sending**, so a bad name can no longer end a multi-hour load with a
+mid-flight Arc 400.
+
+Workflow:
+
+1. **Dry-run first.** Every name Arc would reject is listed with its point
+   count (`INVALID:` lines).
+2. **Author a rename map** for those names — deterministic targets you choose,
+   traceable back to source:
+
+   ```
+   # renames.map — one old=new per line
+   ace-test.castle_services=ace_test_castle_services
+   test.stand-b=test_stand_b
+   ```
+
+   Pass it with `--measurement-map-file renames.map` (or inline, repeatable:
+   `--measurement-map 'ace-test.castle_services=ace_test_castle_services'`).
+   Targets are validated at startup — a typo fails immediately, not mid-load.
+3. **Pick the policy for anything still invalid** with
+   `--on-invalid-measurement`:
+   - `fail` (default) — abort with an actionable error before sending. Keep
+     this with a map: it guarantees nothing unmapped slips through.
+   - `skip` — drop those points, keep loading, report names + point counts at
+     the end. Use to land the good data now and deal with stragglers later.
+   - `map` — deterministic auto-rename (disallowed chars → `_`, `m_` prefix if
+     the name doesn't start with a letter). Beware: distinct names can collide
+     after sanitizing (`a.b` and `a_b` both become `a_b`) and would merge;
+     prefer an explicit map when many names are involved.
+
+Every rename and skip is **recorded in the checkpoint** (table
+`measurement_actions`) and summarized when the run finishes — the audit trail
+that makes renames reversible and skips visible. Query it any time:
+
+```bash
+sqlite3 migration.checkpoint.db \
+  'SELECT source_db, measurement, action, renamed_to, origin, SUM(points)
+   FROM measurement_actions GROUP BY source_db, measurement'
+```
+
+These flags shape chunk bytes, so they join the resume fingerprint: don't
+change them mid-migration (tsm2arc refuses if you do — see §6).
 
 ---
 
@@ -264,6 +320,11 @@ curl -s -H "Authorization: Bearer $ARC_TOKEN" \
   investigate — that's data that didn't land. Check the `--verbose` log for
   `WARN` lines, non-zero `skipped-keys`, or any shard that errored, then resume
   (re-run the same command — it continues where it left off).
+- **If you loaded with `--on-invalid-measurement=skip`**, subtract the skipped
+  point counts (printed at the end of the run, and in the checkpoint's
+  `measurement_actions` table) from the extracted side before comparing —
+  those points are intentionally not in Arc. If you used a rename map, query
+  the Arc side under the **renamed** measurement names.
 
 **2. WAL coverage check.** If you did **not** pass `--waldir`, confirm there's no
 meaningful un-flushed data you skipped:
@@ -298,10 +359,11 @@ will skip everything already done and add only the WAL-resident data).
 | A database/bucket is missing from output | WAL-only + no `--waldir`, filtered out, or (2.x) a system bucket | add `--waldir`; check `--database-filter`; confirm it isn't a system bucket |
 | 2.x buckets show as 16-hex IDs | `influxd.bolt` missing/unreadable | provide `--bolt` or copy `influxd.bolt` next to `engine/` |
 | `arc 401` / permanent error | token not admin-tier or wrong | use an admin token |
+| `invalid measurement name …` (from tsm2arc, before sending) | source measurement names violate Arc's rule (dots etc.) | see §3a: `--dry-run` to list them, then `--measurement-map`/`--measurement-map-file`, or `--on-invalid-measurement=skip\|map` |
 | `arc 413` | `--chunk-bytes` too large for Arc's cap | keep `--chunk-bytes` < 500MB (default 450MB is safe) |
 | Repeated `arc 429` then backoff | Arc under load / too many workers | lower `--workers` and/or `--chunk-bytes` |
 | Arc node OOM | `--workers` too high for Arc's RAM | lower `--workers`; see §4 memory math |
-| `checkpoint was created with different settings` | resuming with a changed `--chunk-bytes`/`--start`/`--end`/`--db-map`/`--precision` | restore the original flags, or use a fresh `--checkpoint` (full re-migration) |
+| `checkpoint was created with different settings` | resuming with a changed `--chunk-bytes`/`--start`/`--end`/`--db-map`/`--precision`/`--measurement-map`/`--on-invalid-measurement` | restore the original flags, or use a fresh `--checkpoint` (full re-migration) |
 | Run aborts on a corrupt TSM file | damaged source file | note the file from the error; consider `--database-filter`/`--start`/`--end` to skip the affected shard's range, then handle it separately |
 | Resume re-sends everything | wrong/missing `--checkpoint` path | always point `--checkpoint` at the same durable file |
 
@@ -320,6 +382,9 @@ tsm2arc \
   --checkpoint PATH     SQLite resume store (default tsm2arc.checkpoint.db)
   --db-map old=new      rename source DB → Arc DB (repeatable)
   --database-filter DB  migrate only this source DB (repeatable)
+  --measurement-map old=new       rename a source measurement (repeatable)
+  --measurement-map-file PATH     file of renames, one old=new per line
+  --on-invalid-measurement MODE   fail|skip|map for names Arc rejects (default fail)
   --start / --end       RFC3339 UTC time filters
   --precision ns|us|ms|s  precision sent to Arc (default ns; tsm2arc always emits ns)
   --include-internal    also migrate InfluxDB's _internal DB
