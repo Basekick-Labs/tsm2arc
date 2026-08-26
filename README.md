@@ -206,7 +206,7 @@ tsm2arc validates every name **client-side, before anything is sent**:
     what was skipped (names + point counts).
   - `map` — auto-rename deterministically: every disallowed character becomes
     `_`, and a name not starting with a letter gets an `m_` prefix (e.g.
-    `ace-test.castle_services` → `ace-test_castle_services`). Distinct source
+    `edge-prod.gateway_services` → `edge-prod_gateway_services`). Distinct source
     names *can* collide after sanitizing (`a.b` and `a_b` both → `a_b`), which
     would merge those measurements — prefer an explicit map when names are
     close together.

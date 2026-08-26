@@ -128,15 +128,15 @@ func (a *validatingArc) measurementCounts() map[string]int {
 
 // measurements mixing valid names with the customer-shaped dotted ones.
 var testMeasurements = []string{
-	"ace-test.castle_services", // invalid: dot
-	"cpu",                      // valid
-	"ramp_mpbase",              // valid
-	"test.stand-b",             // invalid: dot
+	"edge-prod.gateway_services", // invalid: dot
+	"cpu",                        // valid
+	"core_metrics",               // valid
+	"qa.node-b",                  // invalid: dot
 }
 
 func newMeasurementTestEnv(t *testing.T, resolver *measure.Resolver) (runConfig, *validatingArc, *httptest.Server, string) {
 	t.Helper()
-	datadir := writeTSMShardMeasurements(t, "astra", testMeasurements, 3)
+	datadir := writeTSMShardMeasurements(t, "metrics", testMeasurements, 3)
 	arc := &validatingArc{}
 	srv := httptest.NewServer(http.HandlerFunc(arc.handler))
 	t.Cleanup(srv.Close)
@@ -163,7 +163,7 @@ func TestLoadFailsFastOnInvalidMeasurement(t *testing.T) {
 	if err == nil {
 		t.Fatal("load succeeded with invalid measurement names under fail policy")
 	}
-	for _, want := range []string{"ace-test.castle_services", "--measurement-map", "--on-invalid-measurement", "--dry-run"} {
+	for _, want := range []string{"edge-prod.gateway_services", "--measurement-map", "--on-invalid-measurement", "--dry-run"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error should mention %q; got:\n%v", want, err)
 		}
@@ -186,14 +186,14 @@ func TestLoadSkipPolicy(t *testing.T) {
 	if arc.rejects != 0 {
 		t.Fatalf("Arc rejected %d request(s); skip policy must never send invalid names", arc.rejects)
 	}
-	if res.Rows != 6 { // cpu + ramp_mpbase, 3 points each
+	if res.Rows != 6 { // cpu + core_metrics, 3 points each
 		t.Errorf("rows imported = %d, want 6", res.Rows)
 	}
 	if res.SkippedPoints != 6 { // two dotted measurements, 3 points each
 		t.Errorf("skipped points = %d, want 6", res.SkippedPoints)
 	}
 	counts := arc.measurementCounts()
-	if counts["cpu"] != 3 || counts["ramp_mpbase"] != 3 || len(counts) != 2 {
+	if counts["cpu"] != 3 || counts["core_metrics"] != 3 || len(counts) != 2 {
 		t.Errorf("landed measurements = %v", counts)
 	}
 
@@ -206,7 +206,7 @@ func TestLoadSkipPolicy(t *testing.T) {
 		t.Fatalf("measurement report rows = %d, want 2: %+v", len(rows), rows)
 	}
 	for _, r := range rows {
-		if r.Action != "skipped" || r.Points != 3 || r.SourceDB != "astra" {
+		if r.Action != "skipped" || r.Points != 3 || r.SourceDB != "metrics" {
 			t.Errorf("bad skip record: %+v", r)
 		}
 	}
@@ -246,7 +246,7 @@ func TestLoadAutoMapPolicy(t *testing.T) {
 		t.Errorf("rows=%d skipped=%d, want 12/0", res.Rows, res.SkippedPoints)
 	}
 	counts := arc.measurementCounts()
-	for _, m := range []string{"ace-test_castle_services", "test_stand-b", "cpu", "ramp_mpbase"} {
+	for _, m := range []string{"edge-prod_gateway_services", "qa_node-b", "cpu", "core_metrics"} {
 		if counts[m] != 3 {
 			t.Errorf("measurement %q landed %d points, want 3 (all: %v)", m, counts[m], counts)
 		}
@@ -268,8 +268,8 @@ func TestLoadAutoMapPolicy(t *testing.T) {
 
 func TestLoadExplicitMap(t *testing.T) {
 	resolver, err := measure.NewResolver(map[string]string{
-		"ace-test.castle_services": "acetest_castle_services",
-		"test.stand-b":             "test_stand_b",
+		"edge-prod.gateway_services": "edgeprod_gateway_services",
+		"qa.node-b":                  "qa_node_b",
 	}, measure.PolicyFail) // explicit map covers every invalid name → fail policy never fires
 	if err != nil {
 		t.Fatal(err)
@@ -286,7 +286,7 @@ func TestLoadExplicitMap(t *testing.T) {
 		t.Errorf("rows = %d, want 12", res.Rows)
 	}
 	counts := arc.measurementCounts()
-	if counts["acetest_castle_services"] != 3 || counts["test_stand_b"] != 3 {
+	if counts["edgeprod_gateway_services"] != 3 || counts["qa_node_b"] != 3 {
 		t.Errorf("explicit renames didn't land: %v", counts)
 	}
 	rows, _ := cp.MeasurementReport()
@@ -305,8 +305,8 @@ func TestLoadExplicitMap(t *testing.T) {
 // first 400 arrived hours into a load).
 func TestDryRunReportsInvalidMeasurements(t *testing.T) {
 	resolver, _ := measure.NewResolver(
-		map[string]string{"test.stand-b": "test_stand_b"}, measure.PolicyFail)
-	datadir := writeTSMShardMeasurements(t, "astra", testMeasurements, 3)
+		map[string]string{"qa.node-b": "qa_node_b"}, measure.PolicyFail)
+	datadir := writeTSMShardMeasurements(t, "metrics", testMeasurements, 3)
 	shards, err := discover.Walk(datadir, "", nil, false)
 	if err != nil {
 		t.Fatal(err)
@@ -324,8 +324,8 @@ func TestDryRunReportsInvalidMeasurements(t *testing.T) {
 	out, _ := io.ReadAll(rp)
 
 	for _, want := range []string{
-		`INVALID: "ace-test.castle_services" (3 points)`,    // unmapped invalid, loud
-		`rename: "test.stand-b" → "test_stand_b" (explicit`, // mapped invalid, shown
+		`INVALID: "edge-prod.gateway_services" (3 points)`,  // unmapped invalid, loud
+		`rename: "qa.node-b" → "qa_node_b" (explicit`,       // mapped invalid, shown
 		"WARNING: 1 measurement name(s) violate Arc's rule", // final banner
 		"--measurement-map", // remediation hint
 	} {
@@ -334,10 +334,10 @@ func TestDryRunReportsInvalidMeasurements(t *testing.T) {
 		}
 	}
 	// samples must show the FINAL (renamed) name, and never a skipped/invalid one
-	if strings.Contains(string(out), "    ace-test.castle_services,") {
+	if strings.Contains(string(out), "    edge-prod.gateway_services,") {
 		t.Errorf("dry-run sampled an invalid measurement line:\n%s", out)
 	}
-	if !strings.Contains(string(out), "test_stand_b,host=a") {
+	if !strings.Contains(string(out), "qa_node_b,host=a") {
 		t.Errorf("dry-run samples don't show the renamed line:\n%s", out)
 	}
 }

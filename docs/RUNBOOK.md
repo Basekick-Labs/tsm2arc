@@ -163,12 +163,12 @@ Workflow:
 
    ```
    # renames.map — one old=new per line
-   ace-test.castle_services=ace_test_castle_services
-   test.stand-b=test_stand_b
+   edge-prod.gateway_services=edge_prod_gateway_services
+   qa.node-b=qa_node_b
    ```
 
    Pass it with `--measurement-map-file renames.map` (or inline, repeatable:
-   `--measurement-map 'ace-test.castle_services=ace_test_castle_services'`).
+   `--measurement-map 'edge-prod.gateway_services=edge_prod_gateway_services'`).
    Targets are validated at startup — a typo fails immediately, not mid-load.
 3. **Pick the policy for anything still invalid** with
    `--on-invalid-measurement`:

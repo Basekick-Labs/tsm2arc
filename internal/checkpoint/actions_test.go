@@ -19,15 +19,15 @@ func TestMeasurementActions(t *testing.T) {
 	}
 
 	acts := []MeasurementAction{
-		{Measurement: "ace-test.castle", Action: "renamed", RenamedTo: "ace_test_castle", Origin: "explicit", Points: 100},
+		{Measurement: "edge-prod.gateway", Action: "renamed", RenamedTo: "edge_prod_gateway", Origin: "explicit", Points: 100},
 		{Measurement: "test.skip_me", Action: "skipped", Points: 7},
 	}
-	if err := s.RecordMeasurementActions("astra", "1", acts); err != nil {
+	if err := s.RecordMeasurementActions("metrics", "1", acts); err != nil {
 		t.Fatal(err)
 	}
 	// same measurement in a second shard aggregates
-	if err := s.RecordMeasurementActions("astra", "2", []MeasurementAction{
-		{Measurement: "ace-test.castle", Action: "renamed", RenamedTo: "ace_test_castle", Origin: "explicit", Points: 50},
+	if err := s.RecordMeasurementActions("metrics", "2", []MeasurementAction{
+		{Measurement: "edge-prod.gateway", Action: "renamed", RenamedTo: "edge_prod_gateway", Origin: "explicit", Points: 50},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -40,8 +40,8 @@ func TestMeasurementActions(t *testing.T) {
 		t.Fatalf("report rows = %d, want 2: %+v", len(rows), rows)
 	}
 	// ordered by action then measurement: renamed < skipped
-	if r := rows[0]; r.Measurement != "ace-test.castle" || r.Action != "renamed" ||
-		r.RenamedTo != "ace_test_castle" || r.Origin != "explicit" || r.Points != 150 || r.Shards != 2 {
+	if r := rows[0]; r.Measurement != "edge-prod.gateway" || r.Action != "renamed" ||
+		r.RenamedTo != "edge_prod_gateway" || r.Origin != "explicit" || r.Points != 150 || r.Shards != 2 {
 		t.Errorf("renamed row = %+v", r)
 	}
 	if r := rows[1]; r.Measurement != "test.skip_me" || r.Action != "skipped" || r.Points != 7 || r.Shards != 1 {
@@ -50,7 +50,7 @@ func TestMeasurementActions(t *testing.T) {
 
 	// Re-recording a shard (deterministic re-derive on resume) OVERWRITES its
 	// counts instead of accumulating — no double-counting.
-	if err := s.RecordMeasurementActions("astra", "1", acts); err != nil {
+	if err := s.RecordMeasurementActions("metrics", "1", acts); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ = s.MeasurementReport()
@@ -59,7 +59,7 @@ func TestMeasurementActions(t *testing.T) {
 	}
 
 	// nil/empty batch is a no-op
-	if err := s.RecordMeasurementActions("astra", "1", nil); err != nil {
+	if err := s.RecordMeasurementActions("metrics", "1", nil); err != nil {
 		t.Fatal(err)
 	}
 }

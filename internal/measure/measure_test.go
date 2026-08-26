@@ -8,9 +8,9 @@ import (
 )
 
 func TestValid(t *testing.T) {
-	valid := []string{"cpu", "ramp_mpbase", "ace-test", "a", "A9", "m_", "x-y_z2"}
+	valid := []string{"cpu", "core_metrics", "edge-prod", "a", "A9", "m_", "x-y_z2"}
 	invalid := []string{
-		"", "ace-test.castle_services", "2fast", "_lead", "-lead", "9",
+		"", "edge-prod.gateway_services", "2fast", "_lead", "-lead", "9",
 		"with space", "tab\there", "utf8µ", "semi;colon", "eq=ual", "dot.",
 	}
 	for _, s := range valid {
@@ -27,14 +27,14 @@ func TestValid(t *testing.T) {
 
 func TestSanitize(t *testing.T) {
 	cases := map[string]string{
-		"ace-test.castle_services": "ace-test_castle_services",
-		"test.foo":                 "test_foo",
-		"2fast":                    "m_2fast",
-		"_lead":                    "m__lead",
-		"":                         "m_",
-		"a b.c":                    "a_b_c",
-		"µx":                       "m__x", // one underscore per rune, then prefix
-		"already_valid":            "already_valid",
+		"edge-prod.gateway_services": "edge-prod_gateway_services",
+		"test.foo":                   "test_foo",
+		"2fast":                      "m_2fast",
+		"_lead":                      "m__lead",
+		"":                           "m_",
+		"a b.c":                      "a_b_c",
+		"µx":                         "m__x", // one underscore per rune, then prefix
+		"already_valid":              "already_valid",
 	}
 	for in, want := range cases {
 		got := Sanitize(in)
@@ -68,8 +68,8 @@ func TestParsePolicy(t *testing.T) {
 
 func TestResolver(t *testing.T) {
 	m := map[string]string{
-		"ace-test.castle_services": "ace_test_castle_services",
-		"cpu":                      "cpu_renamed", // explicit map also renames valid names
+		"edge-prod.gateway_services": "edge_prod_gateway_services",
+		"cpu":                        "cpu_renamed", // explicit map also renames valid names
 	}
 
 	t.Run("fail", func(t *testing.T) {
@@ -83,7 +83,7 @@ func TestResolver(t *testing.T) {
 		if res := r.Resolve("cpu"); res.Action != ActionRenamed || res.Name != "cpu_renamed" {
 			t.Errorf("explicit valid: %+v", res)
 		}
-		if res := r.Resolve("ace-test.castle_services"); res.Action != ActionRenamed || res.Name != "ace_test_castle_services" {
+		if res := r.Resolve("edge-prod.gateway_services"); res.Action != ActionRenamed || res.Name != "edge_prod_gateway_services" {
 			t.Errorf("explicit invalid: %+v", res)
 		}
 		if res := r.Resolve("test.unmapped"); res.Action != ActionInvalid {
@@ -168,7 +168,7 @@ func TestLoadMapFile(t *testing.T) {
 	content := strings.Join([]string{
 		"# rename plan authored by the operator",
 		"",
-		"ace-test.castle_services=ace_test_castle_services",
+		"edge-prod.gateway_services=edge_prod_gateway_services",
 		"  test.foo=test_foo  ",
 		"",
 	}, "\n")
@@ -179,7 +179,7 @@ func TestLoadMapFile(t *testing.T) {
 	if err := LoadMapFile(path, dst); err != nil {
 		t.Fatal(err)
 	}
-	if len(dst) != 2 || dst["ace-test.castle_services"] != "ace_test_castle_services" || dst["test.foo"] != "test_foo" {
+	if len(dst) != 2 || dst["edge-prod.gateway_services"] != "edge_prod_gateway_services" || dst["test.foo"] != "test_foo" {
 		t.Errorf("loaded map = %v", dst)
 	}
 
