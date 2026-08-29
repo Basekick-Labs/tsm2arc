@@ -131,9 +131,20 @@ You can migrate a subset first to validate the round-trip end to end:
 # one database only
 tsm2arc ... --database-filter telemetry --dry-run
 
-# a time window (RFC3339, UTC) — these are FILTERS, not partitioning
+# a time window (RFC3339, UTC)
 tsm2arc ... --start 2024-01-01T00:00:00Z --end 2024-02-01T00:00:00Z --dry-run
 ```
+
+`--start`/`--end` skip out-of-window TSM blocks straight from the index, so a
+window bounds read work and time as well as output — you can migrate a large
+source in sequential windows.
+
+**Use a separate `--checkpoint` file per window.** Chunk sequence numbers are
+derived from what a run extracts, so a different window means a different chunk
+layout. The tool enforces this: `--start`/`--end` are part of the checkpoint's
+config fingerprint, and resuming a checkpoint with a different window is refused
+with `checkpoint was created with different settings` rather than silently
+skipping chunks.
 
 Mapping:
 
@@ -224,16 +235,27 @@ You can also lower `--chunk-bytes` to reduce per-request memory (e.g.
 Separately from the Arc node, watch the **migration host's** own RAM:
 
 - **Extraction (`--dry-run` and the read side of a load)** streams one series at
-  a time, so it is near-constant memory — bounded by the largest single *series*,
-  not the shard. Even multi-GB shards extract in tens of MB.
+  a time and one TSM block at a time within a series. Peak heap is a few MiB and
+  does **not** grow with the shard, the dataset, or the largest series — measured
+  at 3.7 / 3.8 / 3.9 MiB for series of 500 K / 2 M / 8 M values.
 - **The load adds the chunk buffer**: each worker holds up to `--chunk-bytes` of
   raw line protocol before flushing, so the host uses roughly
-  `workers × chunk-bytes` (e.g. `4 × 450 MB ≈ 1.8 GB`). If the host is memory
-  constrained, lower `--chunk-bytes` and/or `--workers` — neither affects
-  correctness or resume.
+  `workers × chunk-bytes` (e.g. `4 × 450 MB ≈ 1.8 GB`). This dominates, and it is
+  the only migration-host knob worth turning. If the host is memory constrained,
+  lower `--chunk-bytes` and/or `--workers` — neither affects correctness or
+  resume.
+- **File descriptors**: extraction holds one handle per TSM file containing the
+  series currently being merged. Files with non-overlapping time ranges are
+  merged in separate passes, so this is normally one or two. If every file in a
+  shard spans the same time range, budget `workers × files-per-shard` and raise
+  `ulimit -n` accordingly.
 
-(If a `--dry-run` ever uses memory proportional to the *dataset* rather than tens
-of MB, you're on a pre-0.1.2 binary — upgrade.)
+**On memory limits.** If the process is being OOM-killed on the *extraction*
+side, `--workers` and `--chunk-bytes` are the wrong knobs — they bound the load
+buffer, not the read. A binary at 0.1.3 or earlier held one whole series in
+memory at ~8–32× its compressed on-disk size, so a shard with a single very large
+series could not be migrated at any instance size. Upgrade to 0.1.4+, where
+extraction memory is flat.
 
 ---
 

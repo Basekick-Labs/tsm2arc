@@ -123,35 +123,81 @@ func (r *Reader) readIndex() error {
 // ReadKey decodes all blocks for one key into a flat, time-ordered slice of
 // Values. Blocks within a key are already non-overlapping and ascending by the
 // index ordering; we concatenate in entry order.
+//
+// MEMORY: this materializes every value of the key at once. A decoded Value is
+// 64 bytes against ~2-8 compressed bytes on disk, so a multi-GB key costs tens
+// of GB here. Prefer Blocks + ReadBlockAt, which decode one block at a time; the
+// extractor uses those and calls ReadKey only as a fallback for the rare file
+// whose blocks are not ascending.
 func (r *Reader) ReadKey(kb keyBlocks) ([]Value, error) {
 	var out []Value
 	for _, e := range kb.Entries {
-		// Bound the declared block size against the file before allocating: a
-		// corrupt/crafted index entry can claim up to 4 GB (uint32), which would
-		// otherwise allocate before ReadAt fails. Offset+Size must fit in the file.
-		if e.Offset < 0 || e.Offset+int64(e.Size) > r.size {
-			return nil, fmt.Errorf("%w: block at off=%d size=%d exceeds file size %d",
-				errBadBlock, e.Offset, e.Size, r.size)
-		}
-		buf := make([]byte, e.Size)
-		if _, err := r.f.ReadAt(buf, e.Offset); err != nil {
-			return nil, err
-		}
-		vals, err := decodeBlock(kb.Type, buf)
+		vals, err := r.readEntry(kb.Type, kb.Key, e)
 		if err != nil {
-			return nil, fmt.Errorf("decode block for key %q: %w", kb.Key, err)
+			return nil, err
 		}
 		out = append(out, vals...)
 	}
 	return out, nil
 }
 
-// ReadKeyByName decodes all blocks for the named key. Returns nil if the key is
-// not present in this file.
-func (r *Reader) ReadKeyByName(key string) ([]Value, error) {
-	// keys are sorted; binary search
+// readEntry reads and decodes exactly one block.
+func (r *Reader) readEntry(typ byte, key string, e IndexEntry) ([]Value, error) {
+	// Bound the declared block size against the file before allocating: a
+	// corrupt/crafted index entry can claim up to 4 GB (uint32), which would
+	// otherwise allocate before ReadAt fails. Offset+Size must fit in the file.
+	if e.Offset < 0 || e.Offset+int64(e.Size) > r.size {
+		return nil, fmt.Errorf("%w: block at off=%d size=%d exceeds file size %d",
+			errBadBlock, e.Offset, e.Size, r.size)
+	}
+	buf := make([]byte, e.Size)
+	if _, err := r.f.ReadAt(buf, e.Offset); err != nil {
+		return nil, err
+	}
+	vals, err := decodeBlock(typ, buf)
+	if err != nil {
+		return nil, fmt.Errorf("decode block for key %q: %w", key, err)
+	}
+	return vals, nil
+}
+
+// search returns the index of key in r.keys, or -1 if absent.
+func (r *Reader) search(key string) int {
 	i := sort.Search(len(r.keys), func(i int) bool { return r.keys[i].Key >= key })
 	if i >= len(r.keys) || r.keys[i].Key != key {
+		return -1
+	}
+	return i
+}
+
+// Blocks returns the index entries for key, in file order, or nil if the key is
+// not present. Each entry carries the block's [MinTime,MaxTime], so a caller can
+// skip blocks outside a time window WITHOUT reading or decoding them. The slice
+// is owned by the Reader and must not be mutated.
+func (r *Reader) Blocks(key string) []IndexEntry {
+	i := r.search(key)
+	if i < 0 {
+		return nil
+	}
+	return r.keys[i].Entries
+}
+
+// ReadBlockAt decodes one block of key, identified by an entry from Blocks.
+// This is the bounded-memory read path: peak allocation is one block (a TSM
+// block holds at most 1000 values) rather than the whole key.
+func (r *Reader) ReadBlockAt(key string, e IndexEntry) ([]Value, error) {
+	i := r.search(key)
+	if i < 0 {
+		return nil, nil
+	}
+	return r.readEntry(r.keys[i].Type, key, e)
+}
+
+// ReadKeyByName decodes all blocks for the named key. Returns nil if the key is
+// not present in this file. See ReadKey on memory.
+func (r *Reader) ReadKeyByName(key string) ([]Value, error) {
+	i := r.search(key)
+	if i < 0 {
 		return nil, nil
 	}
 	return r.ReadKey(r.keys[i])

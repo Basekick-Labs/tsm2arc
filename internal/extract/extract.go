@@ -9,6 +9,7 @@
 package extract
 
 import (
+	"math"
 	"sort"
 	"strings"
 
@@ -49,33 +50,333 @@ func (s *Stats) observe(ts int64) {
 	}
 }
 
-// fieldStream is one field's decoded values plus its parsed field name.
-type fieldStream struct {
-	field string
-	vals  []tsm.Value
+// ---------------------------------------------------------------------------
+// Value streams
+//
+// A stream is one field's values for one series, ascending by timestamp and
+// already filtered to [start,end]. mergeSeries sees only this interface, so a
+// stream can be a materialized slice (WAL — small) or a lazy block cursor over a
+// TSM file (a series of any size, at bounded memory).
+// ---------------------------------------------------------------------------
+
+// stream is one field's ascending, range-filtered value cursor.
+type stream interface {
+	// name is the field name this stream carries.
+	name() string
+	// peek returns the next value without consuming it. ok is false when the
+	// stream is exhausted; a non-nil error is a decode/IO failure and aborts.
+	peek() (tsm.Value, bool, error)
+	// advance consumes the value last returned by peek.
+	advance()
+	// release drops buffered values and any file-handle reference. Idempotent.
+	release()
 }
 
-// group accumulates all field streams for one series (across TSM + WAL).
+// sliceStream is a fully materialized stream. Used for WAL values (small) and
+// for the single-file File() path.
+type sliceStream struct {
+	field      string
+	vals       []tsm.Value
+	i          int
+	start, end int64
+}
+
+// newSliceStream sorts vals if needed and range-filters on read.
+//
+// The sort matters: the on-disk WAL preserves CLIENT WRITE ORDER, not time
+// order, and un-flushed out-of-order writes are exactly what this tool recovers.
+// Stable, so equal timestamps keep their original order — the last occurrence is
+// consumed last, preserving last-write-wins within a stream.
+func newSliceStream(field string, vals []tsm.Value, start, end int64) *sliceStream {
+	if !ascendingByTime(vals) {
+		sort.SliceStable(vals, func(a, b int) bool { return vals[a].UnixNano < vals[b].UnixNano })
+	}
+	return &sliceStream{field: field, vals: vals, start: start, end: end}
+}
+
+func (s *sliceStream) name() string { return s.field }
+
+func (s *sliceStream) peek() (tsm.Value, bool, error) {
+	for s.i < len(s.vals) {
+		v := s.vals[s.i]
+		if v.UnixNano < s.start {
+			s.i++
+			continue
+		}
+		if v.UnixNano > s.end {
+			s.i = len(s.vals) // ascending → nothing past here is in range
+			break
+		}
+		return v, true, nil
+	}
+	return tsm.Value{}, false, nil
+}
+
+func (s *sliceStream) advance() { s.i++ }
+
+func (s *sliceStream) release() { s.vals, s.i = nil, 0 }
+
+// blockStream is the memory bound. It decodes ONE TSM block of one (file, key)
+// at a time instead of materializing the key's whole value slice. A decoded
+// tsm.Value is 64 bytes against ~2-8 compressed bytes on disk, so materializing
+// a multi-GB key costs tens of GB; a block caps at 1000 values (~64 KB), so an
+// arbitrarily large series now costs ~one block per open stream.
+//
+// Blocks whose [MinTime,MaxTime] does not intersect [start,end] are skipped
+// straight from the index, without being read or decoded — that is what makes
+// --start/--end bound work and memory instead of merely filtering output.
+type blockStream struct {
+	field      string
+	fs         *fileSet
+	fi         int // index into fs.paths
+	key        string
+	start, end int64
+
+	loaded   bool             // index entries resolved
+	entries  []tsm.IndexEntry // pruned to those intersecting [start,end]
+	nextE    int
+	buf      []tsm.Value // the currently decoded block (or the whole key, on fallback)
+	i        int
+	done     bool
+	released bool
+	err      error
+}
+
+func (s *blockStream) name() string { return s.field }
+
+func (s *blockStream) peek() (tsm.Value, bool, error) {
+	for {
+		if s.err != nil {
+			return tsm.Value{}, false, s.err
+		}
+		if s.done {
+			return tsm.Value{}, false, nil
+		}
+		if !s.loaded && !s.loadIndex() {
+			continue // loadIndex set done or err
+		}
+		if s.i >= len(s.buf) {
+			s.loadNext()
+			continue // loadNext set buf, done, or err
+		}
+		v := s.buf[s.i]
+		if v.UnixNano < s.start {
+			s.i++
+			continue
+		}
+		if v.UnixNano > s.end {
+			// Blocks are ascending, so nothing later is in range either.
+			s.finish()
+			continue
+		}
+		return v, true, nil
+	}
+}
+
+func (s *blockStream) advance() { s.i++ }
+
+// loadIndex resolves the key's block entries on first use, prunes them to the
+// time window, and picks the streaming or fallback path. Returns false if the
+// stream finished or failed (the caller re-loops).
+func (s *blockStream) loadIndex() bool {
+	s.loaded = true
+	r, err := s.fs.get(s.fi)
+	if err != nil {
+		s.fail(err)
+		return false
+	}
+	ents := r.Blocks(s.key)
+	if len(ents) == 0 {
+		s.finish()
+		return false
+	}
+	// Streaming relies on a key's blocks being ascending and non-overlapping,
+	// which is a TSM invariant for a written/compacted file. A file that violates
+	// it would silently misorder output, so fall back to reading and sorting the
+	// whole key — for that ONE key, in that ONE file, not the whole series.
+	if !entriesAscending(ents) {
+		vals, rerr := r.ReadKeyByName(s.key)
+		if rerr != nil {
+			s.fail(rerr)
+			return false
+		}
+		if !ascendingByTime(vals) {
+			sort.SliceStable(vals, func(a, b int) bool { return vals[a].UnixNano < vals[b].UnixNano })
+		}
+		s.buf, s.i = vals, 0
+		s.entries, s.nextE = nil, 0
+		return true
+	}
+	s.entries = pruneEntries(ents, s.start, s.end)
+	return true
+}
+
+// loadNext decodes the next in-range block into buf.
+func (s *blockStream) loadNext() {
+	if s.nextE >= len(s.entries) {
+		s.finish()
+		return
+	}
+	r, err := s.fs.get(s.fi)
+	if err != nil {
+		s.fail(err)
+		return
+	}
+	vals, err := r.ReadBlockAt(s.key, s.entries[s.nextE])
+	if err != nil {
+		s.fail(err)
+		return
+	}
+	s.nextE++
+	// Defensive, and cheap: ascendingByTime short-circuits on the normal path.
+	if !ascendingByTime(vals) {
+		sort.SliceStable(vals, func(a, b int) bool { return vals[a].UnixNano < vals[b].UnixNano })
+	}
+	s.buf, s.i = vals, 0
+}
+
+func (s *blockStream) finish() {
+	s.done = true
+	s.release()
+}
+
+func (s *blockStream) fail(err error) {
+	s.err = err
+	s.done = true
+	s.release()
+}
+
+// release drops the decoded block and the file-handle reference. Dropping the
+// reference eagerly is what keeps the open-fd count at one or two even when a
+// single key is split across a hundred TSM files.
+func (s *blockStream) release() {
+	if s.released {
+		return
+	}
+	s.released = true
+	s.buf, s.i, s.entries = nil, 0, nil
+	s.fs.release(s.fi)
+}
+
+// pruneEntries narrows ascending, non-overlapping block entries to those that
+// intersect [start,end]. Pruned blocks are never read from disk.
+func pruneEntries(ents []tsm.IndexEntry, start, end int64) []tsm.IndexEntry {
+	lo := 0
+	for lo < len(ents) && ents[lo].MaxTime < start {
+		lo++
+	}
+	hi := lo
+	for hi < len(ents) && ents[hi].MinTime <= end {
+		hi++
+	}
+	return ents[lo:hi]
+}
+
+// entriesAscending reports whether a key's blocks are ordered and
+// non-overlapping in time. Equal boundary timestamps are fine — the merge
+// consumes every value at a timestamp, across block boundaries.
+func entriesAscending(ents []tsm.IndexEntry) bool {
+	for i := range ents {
+		if ents[i].MinTime > ents[i].MaxTime {
+			return false
+		}
+		if i > 0 && ents[i].MinTime < ents[i-1].MaxTime {
+			return false
+		}
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// File handles
+// ---------------------------------------------------------------------------
+
+// fileSet opens the TSM files one series needs, lazily and at most once, and
+// closes each as soon as the last stream referencing it is done.
+//
+// Streaming means more than one file can be open at a time (the pre-0.1.4 code
+// kept exactly one), and that needs managing: a key big enough to be split
+// across files by the TSM writer's size cap can touch a hundred of them. Those
+// parts hold DISJOINT ascending time ranges, so lazy open plus eager close keeps
+// the concurrently-open count at one or two rather than the whole set.
+type fileSet struct {
+	paths []string
+	open  OpenTSM
+	rs    map[int]TSMFile
+	refs  map[int]int
+}
+
+func newFileSet(paths []string, open OpenTSM) *fileSet {
+	return &fileSet{paths: paths, open: open, rs: map[int]TSMFile{}, refs: map[int]int{}}
+}
+
+// newBlockStream registers a reference to file fi and returns its lazy stream.
+func (fs *fileSet) newBlockStream(field string, fi int, key string, start, end int64) *blockStream {
+	fs.refs[fi]++
+	return &blockStream{field: field, fs: fs, fi: fi, key: key, start: start, end: end}
+}
+
+// get returns the open reader for file fi, opening it on first use.
+func (fs *fileSet) get(fi int) (TSMFile, error) {
+	if r, ok := fs.rs[fi]; ok {
+		return r, nil
+	}
+	r, err := fs.open(fs.paths[fi])
+	if err != nil {
+		return nil, err
+	}
+	fs.rs[fi] = r
+	return r, nil
+}
+
+// release drops one reference to file fi, closing it at zero.
+func (fs *fileSet) release(fi int) {
+	fs.refs[fi]--
+	if fs.refs[fi] > 0 {
+		return
+	}
+	delete(fs.refs, fi)
+	if r, ok := fs.rs[fi]; ok {
+		r.Close()
+		delete(fs.rs, fi)
+	}
+}
+
+// closeAll closes every still-open reader (safety net on the error path).
+func (fs *fileSet) closeAll() {
+	for fi, r := range fs.rs {
+		r.Close()
+		delete(fs.rs, fi)
+	}
+	fs.refs = map[int]int{}
+}
+
+// ---------------------------------------------------------------------------
+// Single-file path (File)
+// ---------------------------------------------------------------------------
+
+// group accumulates all field streams for one series.
 type group struct {
 	seriesKey   string
 	measurement string
 	tags        [][2]string
-	streams     []fieldStream
+	streams     []stream
 }
 
 // collector groups (key, values) streams by series for later field-rejoin.
 type collector struct {
-	groups   []*group
-	bySeries map[string]*group
-	stats    Stats
+	groups     []*group
+	bySeries   map[string]*group
+	stats      Stats
+	start, end int64
 }
 
-func newCollector() *collector {
-	return &collector{bySeries: map[string]*group{}}
+func newCollector(start, end int64) *collector {
+	return &collector{bySeries: map[string]*group{}, start: start, end: end}
 }
 
-// add folds one raw TSM/WAL key and its decoded values into the right series
-// group. A key that can't be parsed (no field separator) is counted as skipped.
+// add folds one raw TSM key and its decoded values into the right series group.
+// A key that can't be parsed (no field separator) is counted as skipped.
 func (c *collector) add(rawKey string, vals []tsm.Value) {
 	k, err := series.ParseKey(rawKey)
 	if err != nil {
@@ -89,28 +390,33 @@ func (c *collector) add(rawKey string, vals []tsm.Value) {
 		c.bySeries[k.SeriesKey] = g
 		c.groups = append(c.groups, g)
 	}
-	g.streams = append(g.streams, fieldStream{field: k.Field, vals: vals})
+	g.streams = append(g.streams, newSliceStream(k.Field, vals, c.start, c.end))
 }
 
 // emit field-rejoins every series in deterministic order and yields points.
-func (c *collector) emit(start, end int64, fn func(Point)) Stats {
+func (c *collector) emit(fn func(Point)) (Stats, error) {
 	sort.Slice(c.groups, func(i, j int) bool { return c.groups[i].seriesKey < c.groups[j].seriesKey })
 	for _, g := range c.groups {
-		mergeSeries(g.measurement, g.tags, g.streams, start, end, &c.stats, fn)
+		if err := mergeSeries(g.measurement, g.tags, g.streams, &c.stats, fn); err != nil {
+			return c.stats, err
+		}
 	}
-	return c.stats
+	return c.stats, nil
 }
 
 // File reads a TSM file and yields reconstructed points to fn, in deterministic
 // order (series key ascending, then timestamp ascending). Optional time bounds
 // [start,end] (ns, inclusive) filter points; pass minInt64/maxInt64 for none.
 // Returns stats. fn may be nil for pure counting (dry-run).
+//
+// This path materializes the whole file; it exists for tests and single-file
+// use. The migration path is Shard, which streams.
 func File(r TSMFile, start, end int64, fn func(Point)) (Stats, error) {
-	c := newCollector()
+	c := newCollector(start, end)
 	if err := addTSM(c, r); err != nil {
 		return c.stats, err
 	}
-	return c.emit(start, end, fn), nil
+	return c.emit(fn)
 }
 
 // addTSM folds every key of a TSM reader into the collector.
@@ -134,20 +440,33 @@ type OpenTSM func(path string) (TSMFile, error)
 // this is a thin wrapper over wal.ReadFile.
 type WALReader func(path string, fn func(key string, vals []tsm.Value)) error
 
+// walStream is one WAL-sourced field stream awaiting its series' turn.
+type walStream struct {
+	field string
+	vals  []tsm.Value
+}
+
+// ---------------------------------------------------------------------------
+// Shard extraction
+// ---------------------------------------------------------------------------
+
 // Shard reconstructs all points of one shard from its TSM files AND its WAL
 // files, field-rejoining across both sources, and yields points to fn in
 // deterministic order (series key ascending, then timestamp ascending).
 //
-// MEMORY: this streams ONE SERIES AT A TIME. It indexes only the key strings of
-// each TSM file up front (cheap — strings + block offsets, not values), then for
-// each series reads just that series' field values, merges, emits, and lets them
-// be collected before the next series. Peak memory is therefore bounded by the
-// largest single SERIES, not the whole shard — critical on multi-GB shards where
-// loading every decoded value at once cost tens of GB of RAM.
+// MEMORY: this streams ONE SERIES AT A TIME and, within a series, ONE BLOCK AT A
+// TIME per field. It indexes only the key strings of each TSM file up front
+// (cheap — strings, not values), then merges each series straight off lazy block
+// cursors. Peak memory is therefore bounded by the number of concurrent field
+// streams times one decoded block (~64 KB) — NOT by the largest series, and not
+// by the shard. That distinction is the difference between migrating a shard
+// with a 250 GB single series and needing terabytes of RAM to do it: a decoded
+// tsm.Value is 64 bytes against ~2-8 compressed bytes on disk, so materializing
+// a series costs 8-32x its on-disk size.
 //
 // The WAL (un-flushed, typically small) is loaded once into a per-series map and
-// merged in alongside the streamed TSM values. TSM values are appended before
-// WAL values for each series so the WAL (newer) wins on a same-(ts,field) tie
+// merged in alongside the streamed TSM values. TSM streams are ordered before
+// WAL streams for each series so the WAL (newer) wins on a same-(ts,field) tie
 // (last-write-wins), matching InfluxDB and Arc compaction.
 //
 // Determinism — required for crash-safe resume — comes from emitting series in
@@ -161,16 +480,19 @@ func Shard(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, star
 	var st Stats
 
 	// 1) Index each TSM file's KEY STRINGS, then CLOSE it. We deliberately do NOT
-	//    hold all readers open at once: a shard can have many TSM files and that
-	//    would risk exhausting the file-descriptor limit at scale. Values are read
-	//    later by re-opening the relevant file per series (TSM open just reads the
-	//    footer + index — cheap). For each series we record which file indices
-	//    hold its keys.
+	//    hold all readers open through this pass: a shard can have many TSM files
+	//    and that would risk exhausting the file-descriptor limit at scale. Values
+	//    are read later by re-opening the relevant file per series (TSM open just
+	//    reads the footer + index — cheap). For each series we record which file
+	//    indices hold its keys.
 	seen := map[string]struct{}{}
 	var seriesOrder []string
-	// series key → file index → the raw (full) keys for that series in that file.
-	// Stores only key STRINGS during indexing (cheap); values are read later.
-	keysBySeriesFile := map[string]map[int][]string{}
+	// series key → file index → that series' keys in that file, plus the time
+	// range they span. Stores only key STRINGS and two int64s during indexing
+	// (cheap); values are read later. The range comes free from the block index
+	// we have already parsed, and lets phase 3 avoid holding files open whose
+	// data cannot interleave (see partitionRuns).
+	keysBySeriesFile := map[string]map[int]*fileKeys{}
 	for fi, tf := range tsmFiles {
 		r, err := openTSM(tf)
 		if err != nil {
@@ -188,16 +510,29 @@ func Shard(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, star
 			}
 			byFile := keysBySeriesFile[k.SeriesKey]
 			if byFile == nil {
-				byFile = map[int][]string{}
+				byFile = map[int]*fileKeys{}
 				keysBySeriesFile[k.SeriesKey] = byFile
 			}
-			byFile[fi] = append(byFile[fi], raw)
+			fk := byFile[fi]
+			if fk == nil {
+				fk = &fileKeys{min: math.MaxInt64, max: math.MinInt64}
+				byFile[fi] = fk
+			}
+			fk.keys = append(fk.keys, raw)
+			for _, e := range r.Blocks(raw) {
+				if e.MinTime < fk.min {
+					fk.min = e.MinTime
+				}
+				if e.MaxTime > fk.max {
+					fk.max = e.MaxTime
+				}
+			}
 		}
 		r.Close()
 	}
 
 	// 2) Load the WAL (small) into per-series field streams once.
-	walBySeries := map[string][]fieldStream{}
+	walBySeries := map[string][]walStream{}
 	for _, wf := range walFiles {
 		if err := readWAL(wf, func(key string, vals []tsm.Value) {
 			k, perr := series.ParseKey(key)
@@ -209,59 +544,133 @@ func Shard(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, star
 				seen[k.SeriesKey] = struct{}{}
 				seriesOrder = append(seriesOrder, k.SeriesKey)
 			}
-			walBySeries[k.SeriesKey] = append(walBySeries[k.SeriesKey], fieldStream{field: k.Field, vals: vals})
+			walBySeries[k.SeriesKey] = append(walBySeries[k.SeriesKey], walStream{field: k.Field, vals: vals})
 		}); err != nil {
 			return st, err
 		}
 	}
 
-	// 3) Emit series in sorted order; per series, re-open only the file(s) that
-	//    hold it, read just that series' values, then close. At most one TSM file
-	//    is open at a time, and only the current series' values are in memory.
+	// 3) Emit series in sorted order. Each series' fields become lazy cursors over
+	//    the file(s) holding them; the merge pulls one block at a time, so only
+	//    the blocks currently being merged are resident.
+	fs := newFileSet(tsmFiles, openTSM)
+	defer fs.closeAll()
+
 	sort.Strings(seriesOrder)
 	for _, sk := range seriesOrder {
 		measurement, tags := series.ParseSeriesKey(sk)
-		var streams []fieldStream
-
-		// Read this series' field streams from each file that holds it, in
-		// ascending file order (deterministic). Re-open the file, read only this
-		// series' keys, close — so at most one TSM file is open at a time.
 		byFile := keysBySeriesFile[sk]
-		for _, fi := range sortedIntKeys(byFile) {
-			rawKeys := byFile[fi]
-			sort.Strings(rawKeys) // deterministic field order before the merge re-sorts
-			r, err := openTSM(tsmFiles[fi])
+		walStreams := walBySeries[sk]
+
+		// Files whose time ranges cannot interleave are merged as separate,
+		// sequential runs — see partitionRuns. Each run opens only its own files.
+		for _, run := range partitionRuns(byFile, len(walStreams) > 0) {
+			var streams []stream
+
+			// One cursor per (file, key), in ascending FILE INDEX order. Files are
+			// sorted by name, i.e. by TSM generation, so a later file is the newer
+			// copy of a key and — being later in this slice, which the stable sort
+			// in mergeSeries preserves — wins a same-(ts,field) tie.
+			for _, fi := range run {
+				rawKeys := byFile[fi].keys
+				sort.Strings(rawKeys) // deterministic field order before the merge re-sorts
+				for _, raw := range rawKeys {
+					k, _ := series.ParseKey(raw) // validated during indexing
+					st.Keys++
+					streams = append(streams, fs.newBlockStream(k.Field, fi, raw, start, end))
+				}
+			}
+			// WAL streams for this series (appended AFTER TSM → WAL wins ties).
+			// partitionRuns guarantees a single run whenever the series has WAL
+			// data, so these are merged against every TSM stream, not a subset.
+			for _, ws := range walStreams {
+				streams = append(streams, newSliceStream(ws.field, ws.vals, start, end))
+			}
+
+			err := mergeSeries(measurement, tags, streams, &st, fn)
+			// Release every cursor — including ones the merge never reached — so
+			// the run's file handles and blocks are gone before the next starts.
+			for _, s := range streams {
+				s.release()
+			}
 			if err != nil {
 				return st, err
 			}
-			for _, raw := range rawKeys {
-				k, _ := series.ParseKey(raw) // validated during indexing
-				vals, rerr := r.ReadKeyByName(raw)
-				if rerr != nil {
-					r.Close()
-					return st, rerr
-				}
-				st.Keys++
-				if len(vals) > 0 {
-					streams = append(streams, fieldStream{field: k.Field, vals: vals})
-				}
-			}
-			r.Close()
 		}
-		// WAL streams for this series (appended AFTER TSM → WAL wins ties).
-		streams = append(streams, walBySeries[sk]...)
-
-		mergeSeries(measurement, tags, streams, start, end, &st, fn)
-		// streams (and the value slices) become unreachable here and are GC'd
-		// before the next series is read — this is what bounds peak memory.
+		delete(walBySeries, sk) // drop this series' WAL values too
 	}
 
 	return st, nil
 }
 
+// fileKeys is one series' keys within one TSM file, plus the time range those
+// keys span (folded from the block index during the indexing pass).
+type fileKeys struct {
+	keys     []string
+	min, max int64
+}
+
+// partitionRuns splits a series' files into groups that must be merged together,
+// ordered so that emitting run after run still yields globally ascending
+// timestamps.
+//
+// Why: a k-way merge has to peek EVERY stream to find the next timestamp, so a
+// single run holds one file descriptor per file containing the series. A key big
+// enough to be split across TSM files by the writer's size cap can live in a
+// hundred of them — times --workers, that is enough to exhaust the fd limit. But
+// those parts hold DISJOINT time ranges, and disjoint ranges cannot interleave:
+// merging them separately, in time order, produces exactly the same output while
+// holding only one file open.
+//
+// Files whose ranges overlap stay in the same run, so last-write-wins between
+// two generations of the same key is untouched (a same-timestamp conflict
+// implies overlap implies same run). A series with WAL data is always a single
+// run: WAL values can land at any timestamp and must be able to overwrite any
+// TSM value, so they have to see every TSM stream at once.
+func partitionRuns(byFile map[int]*fileKeys, hasWAL bool) [][]int {
+	fis := sortedIntKeys(byFile)
+	if hasWAL || len(fis) < 2 {
+		return [][]int{fis}
+	}
+
+	// Order by start time (file index breaks ties) to find disjoint groups.
+	order := append([]int(nil), fis...)
+	sort.SliceStable(order, func(a, b int) bool {
+		fa, fb := byFile[order[a]], byFile[order[b]]
+		if fa.min != fb.min {
+			return fa.min < fb.min
+		}
+		return order[a] < order[b]
+	})
+
+	var runs [][]int
+	var cur []int
+	curMax := int64(math.MinInt64)
+	for _, fi := range order {
+		fk := byFile[fi]
+		if len(cur) > 0 && fk.min > curMax {
+			runs = append(runs, cur)
+			cur, curMax = nil, math.MinInt64
+		}
+		cur = append(cur, fi)
+		if fk.max > curMax {
+			curMax = fk.max
+		}
+	}
+	if len(cur) > 0 {
+		runs = append(runs, cur)
+	}
+	// Within a run, restore ascending file-index order: that is what makes the
+	// newer generation win a same-timestamp tie in mergeSeries.
+	for _, r := range runs {
+		sort.Ints(r)
+	}
+	return runs
+}
+
 // sortedIntKeys returns the int keys of m in ascending order (deterministic
 // file iteration).
-func sortedIntKeys(m map[int][]string) []int {
+func sortedIntKeys(m map[int]*fileKeys) []int {
 	out := make([]int, 0, len(m))
 	for k := range m {
 		out = append(out, k)
@@ -272,103 +681,79 @@ func sortedIntKeys(m map[int][]string) []int {
 
 // mergeSeries merges all field streams of one series on the timestamp axis and
 // emits one Point per distinct timestamp. It is a streaming k-way merge: it
-// advances a cursor per stream and gathers, at each distinct timestamp, the
-// value from every stream that has one. Memory is O(#fields) per series — NOT
-// O(#values) — which is the whole point of the rewrite (the old map-of-maps
-// materialized a second full copy of every value plus per-entry map overhead,
-// dominating peak RSS on large shards).
+// peeks each stream and gathers, at each distinct timestamp, the value from
+// every stream that has one. Memory is O(#streams × one block) — not O(#values).
 //
-// IMPORTANT: each stream's values MUST be ascending by timestamp for the merge.
-// Compacted TSM blocks are written time-ordered, but the on-disk WAL preserves
-// CLIENT WRITE ORDER and is NOT sorted — un-flushed backfills / late-arriving /
-// batched-mixed-timestamp writes produce non-ascending streams, and that
-// un-flushed WAL data is exactly what this tool recovers. So we defensively sort
-// every stream by timestamp here (stable, cheap when already sorted). Without
-// this, a non-ascending stream silently misorders output (breaking resume
-// determinism), drops in-range data after an out-of-range value, and splits one
-// logical point into several.
+// Streams arrive ascending by timestamp and pre-filtered to the time window (see
+// sliceStream / blockStream), so this loop is purely the merge.
 //
 // Semantics: when two streams have a value at the same (ts, field) — e.g. a
 // point in both a TSM file and the WAL of a partially-compacted shard —
-// last-write-wins. Streams are appended TSM-then-WAL (see Shard) and the gather
+// last-write-wins. Streams are ordered TSM-then-WAL (see Shard) and the gather
 // loop lets a later stream overwrite, so the WAL (newer) value wins. Field order
 // in the emitted line is deterministic (streams sorted by field name).
-func mergeSeries(measurement string, tags [][2]string, streams []fieldStream, start, end int64, st *Stats, fn func(Point)) {
+func mergeSeries(measurement string, tags [][2]string, streams []stream, st *Stats, fn func(Point)) error {
 	if len(streams) == 0 {
-		return
+		return nil
 	}
 
 	// Sort streams by field name for deterministic field order in the output.
-	// Stable sort preserves TSM-before-WAL order among equal field names, so the
-	// last-write-wins tie-break (later stream overwrites) stays correct.
-	sort.SliceStable(streams, func(i, j int) bool { return streams[i].field < streams[j].field })
-
-	// Defensively ensure each stream is ascending by timestamp (see note above).
-	// Stable so that, within a stream, equal timestamps keep their original order
-	// (last occurrence consumed last → last-write-wins for intra-stream dupes too).
-	for i := range streams {
-		if !ascendingByTime(streams[i].vals) {
-			vals := streams[i].vals
-			sort.SliceStable(vals, func(a, b int) bool { return vals[a].UnixNano < vals[b].UnixNano })
-		}
-	}
-
-	// cursor[i] is the index of the next unconsumed value in streams[i].vals.
-	cursor := make([]int, len(streams))
+	// Stable sort preserves TSM-before-WAL order (and older-before-newer file
+	// order) among equal field names, so the last-write-wins tie-break — a later
+	// stream overwrites — stays correct.
+	sort.SliceStable(streams, func(i, j int) bool { return streams[i].name() < streams[j].name() })
 
 	// fieldBuf is reused across timestamps (cleared each iteration) to avoid a
 	// per-point allocation; values are tiny structs copied by value.
 	var fieldBuf []lp.Field
 
 	for {
-		// Find the minimum next timestamp across all streams (within [start,end]).
+		// Find the minimum next timestamp across all streams.
 		minTS := int64(0)
 		have := false
-		for i, sdef := range streams {
-			// skip out-of-range values at the head of this stream. Streams are
-			// ascending (sorted above), so once we pass `end` the rest are too.
-			for cursor[i] < len(sdef.vals) {
-				ts := sdef.vals[cursor[i]].UnixNano
-				if ts < start {
-					cursor[i]++
-					continue
-				}
-				if ts > end {
-					cursor[i] = len(sdef.vals) // ascending → nothing past here is in range
-					break
-				}
-				if !have || ts < minTS {
-					minTS = ts
-					have = true
-				}
-				break
+		for _, s := range streams {
+			v, ok, err := s.peek()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				continue
+			}
+			if !have || v.UnixNano < minTS {
+				minTS, have = v.UnixNano, true
 			}
 		}
 		if !have {
-			break // all streams exhausted
+			return nil // all streams exhausted
 		}
 
 		// Gather every stream's value AT minTS (advancing those cursors). A stream
 		// may hold MORE THAN ONE value at minTS (an out-of-order WAL with repeated
 		// timestamps for a field) — consume ALL of them so we never emit a second
-		// point at the same timestamp; the last value consumed wins, matching the
-		// old map-based last-write-wins. Across streams, a later stream (WAL after
-		// TSM) likewise overwrites an earlier one for the same field.
+		// point at the same timestamp; the last value consumed wins. Across
+		// streams, a later stream (WAL after TSM) likewise overwrites an earlier
+		// one for the same field.
 		fieldBuf = fieldBuf[:0]
-		for i, sdef := range streams {
-			for cursor[i] < len(sdef.vals) && sdef.vals[cursor[i]].UnixNano == minTS {
-				v := sdef.vals[cursor[i]]
-				cursor[i]++
+		for _, s := range streams {
+			for {
+				v, ok, err := s.peek()
+				if err != nil {
+					return err
+				}
+				if !ok || v.UnixNano != minTS {
+					break
+				}
+				s.advance()
 				replaced := false
 				for j := range fieldBuf {
-					if fieldBuf[j].Name == sdef.field {
+					if fieldBuf[j].Name == s.name() {
 						fieldBuf[j].Value = v // tie → later occurrence wins
 						replaced = true
 						break
 					}
 				}
 				if !replaced {
-					fieldBuf = append(fieldBuf, lp.Field{Name: sdef.field, Value: v})
+					fieldBuf = append(fieldBuf, lp.Field{Name: s.name(), Value: v})
 				}
 			}
 		}
@@ -405,10 +790,18 @@ func EncodePoint(p Point) string {
 
 // TSMFile is the minimal interface extract needs from a TSM reader, so the
 // reader internals stay decoupled and the extractor is testable with fakes.
+//
+// Blocks + ReadBlockAt are the bounded-memory path: they let the extractor skip
+// out-of-window blocks from the index and decode the rest one at a time.
+// ReadKeyByName materializes a whole key and is used only by File() and by the
+// fallback for a file whose blocks are not ascending.
+//
 // Close releases the underlying file handle (statically guaranteed so a TSM
 // reader can't silently leak fds across a large multi-shard migration).
 type TSMFile interface {
 	Keys() []string
 	ReadKeyByName(key string) ([]tsm.Value, error)
+	Blocks(key string) []tsm.IndexEntry
+	ReadBlockAt(key string, e tsm.IndexEntry) ([]tsm.Value, error)
 	Close() error
 }
