@@ -192,6 +192,16 @@ Workflow:
      after sanitizing (`a.b` and `a_b` both become `a_b`) and would merge;
      prefer an explicit map when many names are involved.
 
+**Hyphens: valid to write, but check your Arc version before you rely on
+them.** Names containing `-` (e.g. `has-hyphen`) pass Arc's rule and migrate
+cleanly, but Arc **before 26.09.1** cannot query them by any SQL form — quoted
+identifiers weren't resolved to storage paths, and an unquoted hyphen is
+subtraction in SQL grammar. On Arc **26.09.1+**, always quote them:
+`FROM "has-hyphen"` (with `x-arc-database`) or `FROM "db"."has-hyphen"`. If
+the target Arc is older and won't be upgraded soon, add the rename to your map
+(`has-hyphen=has_hyphen`). Hyphenated data already migrated is stored correctly
+and becomes queryable on upgrade — nothing needs re-migrating.
+
 Every rename and skip is **recorded in the checkpoint** (table
 `measurement_actions`) and summarized when the run finishes — the audit trail
 that makes renames reversible and skips visible. Query it any time:

@@ -240,6 +240,19 @@ shard, source name, final name, origin, point count) and summarized at the end
 of the run — so each rename is auditable and reversible, and skipped data is
 on record rather than quietly missing.
 
+> **⚠️ Hyphenated names need Arc ≥ 26.09.1 to query.** A name like
+> `has-hyphen` is *valid* — Arc accepts it at write time and tsm2arc migrates
+> it — but Arc versions before **26.09.1** cannot reference it in SQL at all:
+> the query rewriter didn't resolve quoted identifiers, and an unquoted hyphen
+> parses as subtraction, so no syntax reached the table. From 26.09.1 on, query
+> it **quoted** — `FROM "has-hyphen"` (with the `x-arc-database` header) or
+> `FROM "db"."has-hyphen"`. Unquoted hyphenated names are a SQL parse error on
+> every version — that's SQL grammar, not Arc. If your target Arc predates
+> 26.09.1 and can't be upgraded first, rename at migration time:
+> `--measurement-map 'has-hyphen=has_hyphen'`. Data migrated with hyphens
+> before an upgrade is stored correctly and becomes queryable as soon as Arc is
+> upgraded — no re-migration needed.
+
 ```bash
 # preview what would happen
 tsm2arc --datadir /mnt/influx/data --waldir /mnt/influx/wal --dry-run
