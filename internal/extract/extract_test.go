@@ -26,6 +26,21 @@ func (f *fakeReader) Keys() []string {
 func (f *fakeReader) ReadKeyByName(k string) ([]tsm.Value, error) { return f.data[k], nil }
 func (f *fakeReader) Close() error                                { return nil }
 
+// Blocks/ReadBlockAt present each key as a single block, which is enough to
+// satisfy TSMFile. The multi-block streaming path is covered against real TSM
+// files in stream_test.go.
+func (f *fakeReader) Blocks(k string) []tsm.IndexEntry {
+	v := f.data[k]
+	if len(v) == 0 {
+		return nil
+	}
+	return []tsm.IndexEntry{{MinTime: v[0].UnixNano, MaxTime: v[len(v)-1].UnixNano}}
+}
+
+func (f *fakeReader) ReadBlockAt(k string, _ tsm.IndexEntry) ([]tsm.Value, error) {
+	return f.data[k], nil
+}
+
 func TestFieldRejoin(t *testing.T) {
 	// cpu series with two fields at two timestamps → 2 multi-field points.
 	r := &fakeReader{data: map[string][]tsm.Value{

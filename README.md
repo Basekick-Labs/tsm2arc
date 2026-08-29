@@ -141,19 +141,42 @@ correctness are unaffected by the worker count.
 
 ### Memory profile
 
-tsm2arc extracts by **streaming one series at a time** — it indexes only the TSM
-key list up front, then reads, emits, and frees each series' values in turn. So
-on the **migration host**:
+tsm2arc extracts by **streaming one series at a time and, within a series, one
+TSM block at a time**. It indexes only the key list up front, then merges each
+series straight off lazy block cursors. So on the **migration host**:
 
-- **Extraction / `--dry-run`** is near-constant memory, bounded by the largest
-  single *series*, not the shard or dataset. A multi-GB shard extracts in tens of
-  MB. (Earlier versions held a whole shard's decoded values at once — a 36 MB
-  shard could cost ~2.7 GB RSS; v0.1.2+ does the same in ~27 MB.)
+- **Extraction / `--dry-run`** is near-constant memory — it does **not** scale
+  with the shard, the dataset, or the largest series. Measured on one series
+  written as 1000-value blocks:
+
+  | values in the series | peak heap, streaming | peak heap, materializing (≤ 0.1.3) |
+  |---|---|---|
+  | 500 K | 3.7 MiB | 61 MiB |
+  | 2 M | 3.8 MiB | 293 MiB |
+  | 8 M | 3.9 MiB | 1097 MiB |
+
+  Why the old path was so expensive: a decoded value is a **64-byte** struct
+  against ~2–8 compressed bytes on disk, so materializing a series costs roughly
+  **8–32× its on-disk size** (more, transiently, while the slice grows). Versions
+  0.1.2–0.1.3 held one whole *series* at a time, which is fine until a single
+  series is hundreds of GB — then no instance size is large enough. 0.1.4 removes
+  that ceiling.
 - **Load** adds the chunk buffer: each worker accumulates up to `--chunk-bytes`
   of raw line protocol before flushing, so migration-host RAM is roughly
-  `workers × chunk-bytes` (e.g. `4 × 450 MB ≈ 1.8 GB`). Lower `--chunk-bytes`
-  and/or `--workers` to reduce it; both are safe to change (resume/correctness
-  are unaffected).
+  `workers × chunk-bytes` (e.g. `4 × 450 MB ≈ 1.8 GB`). This dominates the
+  extraction cost, and it is the only migration-host knob that matters. Lower
+  `--chunk-bytes` and/or `--workers` to reduce it; both are safe to change
+  (resume/correctness are unaffected).
+
+`--start` / `--end` also bound *work*, not just output: blocks whose time range
+falls outside the window are skipped straight from the TSM index and never read
+or decoded. (Before 0.1.4 they filtered output only, after full decode.)
+
+**File descriptors.** Streaming keeps a handle open per TSM file holding the
+series being merged. Files whose time ranges cannot interleave are merged as
+separate passes, so a key split across many files costs one or two handles, not
+one per file. On a shard whose files all span the same time range, budget
+`workers × files-per-shard` descriptors and raise `ulimit -n` if needed.
 
 On the **Arc node**, each in-flight import is buffered server-side (~`chunk-bytes`
 decompressed + parsed records), so its peak is `workers × ~1–1.3 GB` — usually
