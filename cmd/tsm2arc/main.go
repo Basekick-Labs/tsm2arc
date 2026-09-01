@@ -111,6 +111,7 @@ func main() {
 		dryRun       = flag.Bool("dry-run", false, "extract + count, do not write to Arc")
 		sampleN      = flag.Int("sample", 5, "print up to N sample LP lines per database (dry-run)")
 		verbose      = flag.Bool("verbose", false, "verbose per-shard/chunk logging")
+		pipeline     = flag.Bool("pipeline", true, "overlap extraction with upload (one extra chunk buffer per worker); =false reverts to serial send")
 		inclInternal = flag.Bool("include-internal", false, "include InfluxDB 1.x's _internal database (2.x system buckets are always skipped)")
 		showVersion  = flag.Bool("version", false, "print version and exit")
 		onInvalid    = flag.String("on-invalid-measurement", "fail", "what to do with a measurement name Arc would reject (after --measurement-map): fail|skip|map (map = deterministic auto-rename, recorded in the checkpoint)")
@@ -296,6 +297,7 @@ func main() {
 		resolver:  resolver,
 		verbose:   *verbose,
 		workers:   *workers,
+		pipeline:  *pipeline,
 	}
 
 	if *dryRun {
@@ -352,6 +354,7 @@ type runConfig struct {
 	resolver  *measure.Resolver // nil (tests) = pass-through, no validation
 	verbose   bool
 	workers   int
+	pipeline  bool // overlap extraction with send (see loadShard)
 }
 
 func (c runConfig) arcDB(sourceDB string) string {

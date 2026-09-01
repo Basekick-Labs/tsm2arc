@@ -9,6 +9,7 @@
 package extract
 
 import (
+	"fmt"
 	"math"
 	"sort"
 	"strings"
@@ -19,7 +20,17 @@ import (
 )
 
 // Point is a fully reconstructed multi-field point.
+//
+// SeriesKey is the RAW on-disk series key (measurement + escaped tags, without
+// the field suffix) — the extraction-order identity of the series. Resume
+// cursors must be built from it, never from the (possibly renamed) Measurement:
+// tag unescaping is lossy, so a re-escaped round trip is not byte-exact.
+//
+// Fields is only valid for the duration of the emit callback — the underlying
+// buffer is reused for the next point. A callback that needs the values past
+// its return must copy them (every current caller encodes immediately).
 type Point struct {
+	SeriesKey   string
 	Measurement string
 	Tags        [][2]string
 	UnixNano    int64
@@ -397,7 +408,7 @@ func (c *collector) add(rawKey string, vals []tsm.Value) {
 func (c *collector) emit(fn func(Point)) (Stats, error) {
 	sort.Slice(c.groups, func(i, j int) bool { return c.groups[i].seriesKey < c.groups[j].seriesKey })
 	for _, g := range c.groups {
-		if err := mergeSeries(g.measurement, g.tags, g.streams, &c.stats, fn); err != nil {
+		if err := mergeSeries(g.seriesKey, g.measurement, g.tags, g.streams, &c.stats, fn); err != nil {
 			return c.stats, err
 		}
 	}
@@ -477,6 +488,30 @@ type walStream struct {
 // an import cycle. A TSM file that fails to open/parse aborts with an error; WAL
 // tails that are truncated are tolerated inside readWAL.
 func Shard(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, start, end int64, fn func(Point)) (Stats, error) {
+	return ShardResume(tsmFiles, walFiles, openTSM, readWAL, start, end, nil, fn)
+}
+
+// Cursor identifies the last point of a shard already delivered downstream, as
+// (raw series key, timestamp). Because a shard's emission order is deterministic
+// (series key ascending, then strictly ascending unique timestamps within a
+// series), a cursor splits the shard's output exactly: everything at or before
+// it has been emitted, everything after has not.
+type Cursor struct {
+	SeriesKey string
+	UnixNano  int64
+}
+
+// ShardResume is Shard with an optional resume cursor. A nil cursor extracts
+// everything. With a cursor, series ordered before cursor.SeriesKey are skipped
+// wholesale (no block reads), and the cursor series is emitted from
+// cursor.UnixNano+1 — block pruning then skips its already-delivered blocks, so
+// resuming deep into a large shard reads almost nothing it doesn't need.
+//
+// The cursor series must exist in the shard: extraction order is only
+// meaningful against the same source data, so a missing series means the shard
+// changed since the cursor was written, and ShardResume fails loudly rather
+// than silently mis-aligning.
+func ShardResume(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, start, end int64, cur *Cursor, fn func(Point)) (Stats, error) {
 	var st Stats
 
 	// 1) Index each TSM file's KEY STRINGS, then CLOSE it. We deliberately do NOT
@@ -557,7 +592,30 @@ func Shard(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, star
 	defer fs.closeAll()
 
 	sort.Strings(seriesOrder)
+	if cur != nil {
+		// Seek: drop every series wholly before the cursor. The cursor series
+		// must be present — a shard whose series set changed since the cursor was
+		// written cannot be resumed by position.
+		i := sort.SearchStrings(seriesOrder, cur.SeriesKey)
+		if i == len(seriesOrder) || seriesOrder[i] != cur.SeriesKey {
+			return st, fmt.Errorf("resume cursor series %q not found in shard: source data changed since the checkpoint was written", cur.SeriesKey)
+		}
+		seriesOrder = seriesOrder[i:]
+	}
 	for _, sk := range seriesOrder {
+		// Within the cursor series, resume from the next timestamp; block pruning
+		// (pruneEntries / sliceStream filtering) then skips everything already
+		// delivered. Timestamps within a series are strictly ascending and unique,
+		// so cursor.UnixNano+1 is an exact boundary.
+		seriesStart := start
+		if cur != nil && sk == cur.SeriesKey {
+			if cur.UnixNano == math.MaxInt64 {
+				continue // series fully delivered; +1 would overflow
+			}
+			if s := cur.UnixNano + 1; s > seriesStart {
+				seriesStart = s
+			}
+		}
 		measurement, tags := series.ParseSeriesKey(sk)
 		byFile := keysBySeriesFile[sk]
 		walStreams := walBySeries[sk]
@@ -577,17 +635,17 @@ func Shard(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, star
 				for _, raw := range rawKeys {
 					k, _ := series.ParseKey(raw) // validated during indexing
 					st.Keys++
-					streams = append(streams, fs.newBlockStream(k.Field, fi, raw, start, end))
+					streams = append(streams, fs.newBlockStream(k.Field, fi, raw, seriesStart, end))
 				}
 			}
 			// WAL streams for this series (appended AFTER TSM → WAL wins ties).
 			// partitionRuns guarantees a single run whenever the series has WAL
 			// data, so these are merged against every TSM stream, not a subset.
 			for _, ws := range walStreams {
-				streams = append(streams, newSliceStream(ws.field, ws.vals, start, end))
+				streams = append(streams, newSliceStream(ws.field, ws.vals, seriesStart, end))
 			}
 
-			err := mergeSeries(measurement, tags, streams, &st, fn)
+			err := mergeSeries(sk, measurement, tags, streams, &st, fn)
 			// Release every cursor — including ones the merge never reached — so
 			// the run's file handles and blocks are gone before the next starts.
 			for _, s := range streams {
@@ -687,20 +745,35 @@ func sortedIntKeys(m map[int]*fileKeys) []int {
 // Streams arrive ascending by timestamp and pre-filtered to the time window (see
 // sliceStream / blockStream), so this loop is purely the merge.
 //
+// COST: the find-min and gather passes below scan every stream once per emitted
+// timestamp. Before coalescing, a series had one stream per (file, field), so a
+// shard with hundreds of overlapping TSM generations and wide rows paid
+// O(files × fields) peeks per row — the dominant CPU cost of a migration.
+// coalesceByField collapses that to one stream per field, and fieldMergeStream
+// makes each per-field advance O(log files) via a heap, so the per-row cost is
+// O(fields + values·log files).
+//
 // Semantics: when two streams have a value at the same (ts, field) — e.g. a
 // point in both a TSM file and the WAL of a partially-compacted shard —
 // last-write-wins. Streams are ordered TSM-then-WAL (see Shard) and the gather
-// loop lets a later stream overwrite, so the WAL (newer) value wins. Field order
-// in the emitted line is deterministic (streams sorted by field name).
-func mergeSeries(measurement string, tags [][2]string, streams []stream, st *Stats, fn func(Point)) error {
+// loop lets a later stream overwrite, so the WAL (newer) value wins; a
+// fieldMergeStream yields equal-timestamp values in exactly that child order,
+// so coalescing preserves the winner byte for byte. Field order in the emitted
+// line is deterministic (streams sorted by field name).
+func mergeSeries(seriesKey, measurement string, tags [][2]string, streams []stream, st *Stats, fn func(Point)) error {
 	if len(streams) == 0 {
 		return nil
 	}
 
+	// Collapse to one stream per field (preserving the original stream order
+	// within each field — that order IS the last-write-wins precedence).
+	streams = coalesceByField(streams)
+
 	// Sort streams by field name for deterministic field order in the output.
 	// Stable sort preserves TSM-before-WAL order (and older-before-newer file
 	// order) among equal field names, so the last-write-wins tie-break — a later
-	// stream overwrites — stays correct.
+	// stream overwrites — stays correct. (After coalescing names are unique, but
+	// stability is kept so the invariant doesn't depend on that.)
 	sort.SliceStable(streams, func(i, j int) bool { return streams[i].name() < streams[j].name() })
 
 	// fieldBuf is reused across timestamps (cleared each iteration) to avoid a
@@ -762,11 +835,159 @@ func mergeSeries(measurement string, tags [][2]string, streams []stream, st *Sta
 		st.Fields += len(fieldBuf)
 		st.observe(minTS)
 		if fn != nil {
-			// Copy fieldBuf into a right-sized slice the callback may retain.
-			fields := make([]lp.Field, len(fieldBuf))
-			copy(fields, fieldBuf)
-			fn(Point{Measurement: measurement, Tags: tags, UnixNano: minTS, Fields: fields})
+			// fieldBuf is reused for the next timestamp: Fields is only valid
+			// during the callback (documented on Point). Not copying here removes
+			// a per-row allocation that dominated GC churn on wide rows.
+			fn(Point{SeriesKey: seriesKey, Measurement: measurement, Tags: tags, UnixNano: minTS, Fields: fieldBuf})
 		}
+	}
+}
+
+// coalesceByField groups streams by field name, wrapping each multi-stream
+// field into one fieldMergeStream. Within a field the original stream order is
+// preserved — older TSM generation first, WAL last — because that order is the
+// last-write-wins precedence the merge relies on.
+func coalesceByField(streams []stream) []stream {
+	byName := map[string][]stream{}
+	var order []string
+	for _, s := range streams {
+		n := s.name()
+		if _, ok := byName[n]; !ok {
+			order = append(order, n)
+		}
+		byName[n] = append(byName[n], s)
+	}
+	if len(order) == len(streams) {
+		return streams // every field has one stream — nothing to wrap
+	}
+	out := make([]stream, 0, len(order))
+	for _, n := range order {
+		if g := byName[n]; len(g) == 1 {
+			out = append(out, g[0])
+		} else {
+			out = append(out, &fieldMergeStream{field: n, children: g})
+		}
+	}
+	return out
+}
+
+// fieldMergeStream merges every stream of ONE field (its copies across TSM
+// generations, plus WAL) into a single ascending cursor, so the outer merge
+// scans one stream per field instead of one per (file, field).
+//
+// It yields ALL values, including duplicates at equal timestamps, in exactly
+// the order the outer gather loop used to consume them: timestamp ascending,
+// and at equal timestamps in child order (older generation before newer before
+// WAL, each child's own order within itself). The outer loop's
+// "later value overwrites" rule therefore picks the identical winner, keeping
+// output byte-identical with the uncoalesced merge.
+//
+// The heap is keyed on (timestamp, child ordinal). After advancing a child, its
+// next value re-enters at the same ordinal, so a child's consecutive
+// equal-timestamp values drain fully before a later child's — matching the old
+// per-stream inner loop.
+type fieldMergeStream struct {
+	field    string
+	children []stream
+	h        []fmsEntry // min-heap on (v.UnixNano, idx)
+	inited   bool
+	err      error
+	released bool
+}
+
+// fmsEntry is one child's memoized head value.
+type fmsEntry struct {
+	v   tsm.Value
+	idx int // ordinal in children — the equal-timestamp tie-break
+}
+
+func (s *fieldMergeStream) name() string { return s.field }
+
+func (s *fieldMergeStream) peek() (tsm.Value, bool, error) {
+	if s.err != nil {
+		return tsm.Value{}, false, s.err
+	}
+	if !s.inited {
+		s.inited = true
+		for i, c := range s.children {
+			v, ok, err := c.peek()
+			if err != nil {
+				s.err = err
+				return tsm.Value{}, false, err
+			}
+			if ok {
+				s.h = append(s.h, fmsEntry{v: v, idx: i})
+			}
+		}
+		for i := len(s.h)/2 - 1; i >= 0; i-- {
+			s.siftDown(i)
+		}
+	}
+	if len(s.h) == 0 {
+		return tsm.Value{}, false, nil
+	}
+	return s.h[0].v, true, nil
+}
+
+// advance consumes the current minimum and refills from that child, restoring
+// the heap in O(log children).
+func (s *fieldMergeStream) advance() {
+	if len(s.h) == 0 {
+		return
+	}
+	c := s.children[s.h[0].idx]
+	c.advance()
+	v, ok, err := c.peek()
+	if err != nil {
+		s.err = err // surfaced by the next peek
+		return
+	}
+	if ok {
+		s.h[0].v = v
+		s.siftDown(0)
+		return
+	}
+	last := len(s.h) - 1
+	s.h[0] = s.h[last]
+	s.h = s.h[:last]
+	if len(s.h) > 0 {
+		s.siftDown(0)
+	}
+}
+
+func (s *fieldMergeStream) release() {
+	if s.released {
+		return
+	}
+	s.released = true
+	for _, c := range s.children {
+		c.release()
+	}
+	s.h = nil
+}
+
+func (s *fieldMergeStream) less(a, b fmsEntry) bool {
+	if a.v.UnixNano != b.v.UnixNano {
+		return a.v.UnixNano < b.v.UnixNano
+	}
+	return a.idx < b.idx
+}
+
+func (s *fieldMergeStream) siftDown(i int) {
+	for {
+		l, r := 2*i+1, 2*i+2
+		min := i
+		if l < len(s.h) && s.less(s.h[l], s.h[min]) {
+			min = l
+		}
+		if r < len(s.h) && s.less(s.h[r], s.h[min]) {
+			min = r
+		}
+		if min == i {
+			return
+		}
+		s.h[i], s.h[min] = s.h[min], s.h[i]
+		i = min
 	}
 }
 

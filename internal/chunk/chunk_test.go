@@ -7,16 +7,24 @@ import (
 )
 
 func collect(maxBytes int, lines []string) (chunks [][]byte, seqs []int) {
-	a := New(maxBytes, func(ctx context.Context, seq int, lp []byte) error {
+	chunks, seqs, _ = collectMarked(maxBytes, lines)
+	return
+}
+
+// collectMarked appends each line with a marker carrying its index, so tests
+// can assert which line's marker each flush received.
+func collectMarked(maxBytes int, lines []string) (chunks [][]byte, seqs []int, lastIdx []int64) {
+	a := New(maxBytes, func(ctx context.Context, seq int, lp []byte, m Marker) error {
 		cp := make([]byte, len(lp)) // buffer is reused; copy for assertion
 		copy(cp, lp)
 		chunks = append(chunks, cp)
 		seqs = append(seqs, seq)
+		lastIdx = append(lastIdx, m.UnixNano)
 		return nil
 	})
 	ctx := context.Background()
-	for _, l := range lines {
-		if err := a.Append(ctx, []byte(l)); err != nil {
+	for i, l := range lines {
+		if err := a.Append(ctx, []byte(l), Marker{SeriesKey: "s", UnixNano: int64(i)}); err != nil {
 			panic(err)
 		}
 	}

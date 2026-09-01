@@ -49,6 +49,58 @@ func EncodePoint(b *strings.Builder, measurement string, tags [][2]string, field
 	b.WriteByte('\n')
 }
 
+// AppendPoint appends the same line EncodePoint produces onto dst and returns
+// the extended slice, allocating nothing when dst has capacity and no token
+// needs escaping. This is the load path's encoder: with wide rows (tens of KB
+// of LP per line) the Builder+string round trip cost several transient copies
+// per row; appending into a reused buffer costs one.
+//
+// Byte-identity with EncodePoint is guaranteed by construction (strconv's
+// Append* variants produce the same bytes as their Format* counterparts) and
+// asserted by TestAppendPointMatchesEncodePoint.
+func AppendPoint(dst []byte, measurement string, tags [][2]string, fields []Field, unixNano int64) []byte {
+	dst = append(dst, escapeMeasurement(measurement)...)
+	for _, t := range tags {
+		dst = append(dst, ',')
+		dst = append(dst, escapeTag(t[0])...)
+		dst = append(dst, '=')
+		dst = append(dst, escapeTag(t[1])...)
+	}
+	dst = append(dst, ' ')
+	for i, f := range fields {
+		if i > 0 {
+			dst = append(dst, ',')
+		}
+		dst = append(dst, escapeTag(f.Name)...) // field keys escape like tag keys
+		dst = append(dst, '=')
+		dst = appendFieldValue(dst, f.Value)
+	}
+	dst = append(dst, ' ')
+	dst = strconv.AppendInt(dst, unixNano, 10)
+	return append(dst, '\n')
+}
+
+func appendFieldValue(dst []byte, v tsm.Value) []byte {
+	switch v.Type {
+	case tsm.BlockFloat:
+		return strconv.AppendFloat(dst, v.Float, 'g', -1, 64)
+	case tsm.BlockInteger:
+		return append(strconv.AppendInt(dst, v.Integer, 10), 'i')
+	case tsm.BlockUnsigned:
+		return append(strconv.AppendUint(dst, v.Unsigned, 10), 'u')
+	case tsm.BlockBoolean:
+		if v.Boolean {
+			return append(dst, "true"...)
+		}
+		return append(dst, "false"...)
+	case tsm.BlockString:
+		dst = append(dst, '"')
+		dst = append(dst, escapeStringField(v.String)...)
+		return append(dst, '"')
+	}
+	return dst
+}
+
 func writeFieldValue(b *strings.Builder, v tsm.Value) {
 	switch v.Type {
 	case tsm.BlockFloat:

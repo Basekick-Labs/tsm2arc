@@ -248,12 +248,14 @@ Separately from the Arc node, watch the **migration host's** own RAM:
   a time and one TSM block at a time within a series. Peak heap is a few MiB and
   does **not** grow with the shard, the dataset, or the largest series — measured
   at 3.7 / 3.8 / 3.9 MiB for series of 500 K / 2 M / 8 M values.
-- **The load adds the chunk buffer**: each worker holds up to `--chunk-bytes` of
-  raw line protocol before flushing, so the host uses roughly
-  `workers × chunk-bytes` (e.g. `4 × 450 MB ≈ 1.8 GB`). This dominates, and it is
-  the only migration-host knob worth turning. If the host is memory constrained,
-  lower `--chunk-bytes` and/or `--workers` — neither affects correctness or
-  resume.
+- **The load adds the chunk buffers**: each worker holds up to `--chunk-bytes`
+  of raw line protocol being accumulated, and (since 0.1.5) a second chunk in
+  flight to Arc — extraction and upload overlap by default. Budget roughly
+  `workers × 2 × chunk-bytes` (e.g. `4 × 2 × 450 MB ≈ 3.6 GB`); `--pipeline=false`
+  reverts to serial send and the pre-0.1.5 `workers × chunk-bytes`. This
+  dominates, and these are the only migration-host knobs worth turning. If the
+  host is memory constrained, lower `--chunk-bytes` and/or `--workers` — none of
+  the three affects correctness or resume.
 - **File descriptors**: extraction holds one handle per TSM file containing the
   series currently being merged. Files with non-overlapping time ranges are
   merged in separate passes, so this is normally one or two. If every file in a
@@ -266,6 +268,20 @@ buffer, not the read. A binary at 0.1.3 or earlier held one whole series in
 memory at ~8–32× its compressed on-disk size, so a shard with a single very large
 series could not be migrated at any instance size. Upgrade to 0.1.4+, where
 extraction memory is flat.
+
+### Spreading load across a multi-writer cluster (Kubernetes)
+
+If Arc runs as several writer pods behind a standard Kubernetes `Service`, be
+aware that a ClusterIP Service balances **per TCP connection**, not per request.
+tsm2arc keeps HTTP connections alive and reuses them for its large sequential
+POSTs, so a handful of long-lived connections each stay pinned to whichever pod
+they first dialed — one writer can end up taking nearly all the traffic while
+the others idle.
+
+The fix is on the routing layer, not the client: put an **L7 (HTTP-aware) load
+balancer** in front of the writers — an ingress controller, Envoy/HAProxy, or a
+cloud ALB — which balances each request independently. With that in place,
+import traffic spreads evenly across writers with no tsm2arc changes.
 
 ---
 
@@ -290,6 +306,10 @@ While it runs, a heartbeat line reports progress:
 [12/40 shards] 3821 chunks, 18402991 rows, 4210.5 MB raw — 38211 rows/s, 9.4 MB/s (480s)
 ```
 
+On a resume of a pre-0.1.5 checkpoint the line also shows the catch-up phase
+(`… 0 chunks (+3401 skipped on resume) …`), so re-derivation is visibly
+progressing rather than looking like a hang.
+
 - Put the `--checkpoint` file somewhere durable and **keep it** — it is how
   resume works.
 - Avoid running two `tsm2arc` processes against the **same checkpoint file** at
@@ -302,8 +322,16 @@ While it runs, a heartbeat line reports progress:
 Re-run the **exact same command**. The tool:
 
 - skips shards already fully migrated (no re-extraction),
-- for a partially-migrated shard, re-derives its chunks deterministically and
-  resumes from the first un-acknowledged chunk.
+- for a partially-migrated shard, **seeks** to the stored cursor: series before
+  it are never read, blocks at or before it are skipped from the TSM index, and
+  sending continues at the first un-acknowledged chunk within seconds to
+  minutes — not hours of re-decoding.
+
+A checkpoint written by tsm2arc ≤ 0.1.4 has no cursor; those shards fall back to
+the old behavior (re-derive everything, skip already-sent chunks without
+re-sending). The heartbeat's `+N skipped on resume` counter shows that phase.
+Once 0.1.5 has committed a chunk, the shard has a cursor and later resumes
+seek.
 
 ```bash
 # identical command — it picks up where it left off

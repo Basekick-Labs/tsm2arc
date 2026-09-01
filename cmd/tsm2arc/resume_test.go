@@ -125,7 +125,7 @@ func TestResumePersistedButUncheckpointed(t *testing.T) {
 
 	cpPath := filepath.Join(t.TempDir(), "cp.db")
 	shards, _ := discover.Walk(datadir, "", nil, false)
-	cfg := runConfig{shards: shards, start: math.MinInt64, end: math.MaxInt64, chunkSize: 256}
+	cfg := runConfig{shards: shards, start: math.MinInt64, end: math.MaxInt64, chunkSize: 256, pipeline: true}
 	ctx := context.Background()
 
 	// Run 1: open checkpoint, send a couple chunks, but DROP the last checkpoint
@@ -173,9 +173,11 @@ func TestResumePersistedButUncheckpointed(t *testing.T) {
 		len(lines), arc.rows, overlap)
 }
 
-// rewindLastCommit lowers a shard's committed_seq by 1 and clears its done mark,
-// simulating a crash where the last chunk was persisted by Arc but its
-// checkpoint commit was lost.
+// rewindLastCommit lowers a shard's committed_seq by 1 and clears its done
+// mark, simulating a crash where the last chunk was persisted by Arc but its
+// checkpoint commit was lost. The cursor is reset to NULL (a lost commit in
+// production loses seq and cursor together; NULL additionally routes the
+// resume through the legacy re-derive path, keeping it covered).
 func rewindLastCommit(t *testing.T, path, db, shard string) {
 	t.Helper()
 	s, err := checkpoint.Open(path)
@@ -183,7 +185,7 @@ func rewindLastCommit(t *testing.T, path, db, shard string) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	if err := s.RewindForTest(db, shard); err != nil {
+	if err := s.RewindForTest(db, shard, nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -202,7 +204,7 @@ func TestResumeAfterCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 	// ~40 bytes/line, chunk=256 → ~6 lines/chunk → ~10 chunks for 60 points.
-	cfg := runConfig{shards: shards, start: math.MinInt64, end: math.MaxInt64, chunkSize: 256}
+	cfg := runConfig{shards: shards, start: math.MinInt64, end: math.MaxInt64, chunkSize: 256, pipeline: true}
 	ctx := context.Background()
 
 	// --- Run 1: crashes after 3 accepted chunks.
@@ -232,7 +234,8 @@ func TestResumeAfterCrash(t *testing.T) {
 	}
 	t.Logf("after crash: committed=%d, arc accepted %d chunks / %d rows", committed, arc.accepts, arc.rows)
 
-	// --- Run 2: stop crashing, resume.
+	// --- Run 2: stop crashing, resume. The checkpoint carries a cursor, so the
+	// resume SEEKS: nothing is re-derived, so nothing shows as "skipped".
 	arc.crashAfter = -1
 	cp2, err := checkpoint.Open(cpPath)
 	if err != nil {
@@ -243,8 +246,8 @@ func TestResumeAfterCrash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resume run failed: %v", err)
 	}
-	if res.SkippedChunks != 3 {
-		t.Errorf("resume skipped %d chunks, want 3", res.SkippedChunks)
+	if res.SkippedChunks != 0 {
+		t.Errorf("seek resume re-derived and skipped %d chunks, want 0 (it should seek)", res.SkippedChunks)
 	}
 
 	// --- Verify: every point present exactly once-or-more, no gaps.
@@ -272,5 +275,142 @@ func TestResumeAfterCrash(t *testing.T) {
 	}
 	if res3.Chunks != 0 || res3.SkippedShards != 1 {
 		t.Errorf("third run did work: chunks=%d skippedShards=%d (want 0/1)", res3.Chunks, res3.SkippedShards)
+	}
+}
+
+// TestFinalChunkFailureBlocksDoneMark is the pipeline drain barrier's test:
+// extraction can finish while the shard's LAST chunk is still in flight. If
+// that send fails, the shard must error — never be marked done — or the lost
+// chunk would be unrecoverable on resume.
+func TestFinalChunkFailureBlocksDoneMark(t *testing.T) {
+	const nSeries = 12 // ~2 chunks at chunkSize 256
+	datadir := writeTSMShard(t, "metrics", nSeries)
+
+	arc := &crashingArc{crashAfter: 1} // accept chunk 0, fail the final chunk
+	srv := httptest.NewServer(http.HandlerFunc(arc.handler))
+	defer srv.Close()
+
+	cpPath := filepath.Join(t.TempDir(), "cp.db")
+	shards, _ := discover.Walk(datadir, "", nil, false)
+	cfg := runConfig{shards: shards, start: math.MinInt64, end: math.MaxInt64, chunkSize: 256, pipeline: true}
+
+	cp, _ := checkpoint.Open(cpPath)
+	_, err := load(context.Background(), cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp)
+	if err == nil {
+		t.Fatal("load succeeded although the final chunk was never acknowledged")
+	}
+	done, _ := cp.IsShardDone("metrics", "1")
+	committed, _ := cp.CommittedSeq("metrics", "1")
+	cp.Close()
+	if done {
+		t.Fatal("shard marked done with its final chunk unacknowledged — data loss on resume")
+	}
+	if committed != 0 {
+		t.Errorf("committed = %d, want 0 (only the accepted chunk)", committed)
+	}
+
+	// Resume delivers the missing chunk and completes.
+	arc.crashAfter = -1
+	cp2, _ := checkpoint.Open(cpPath)
+	if _, err := load(context.Background(), cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp2); err != nil {
+		t.Fatalf("resume failed: %v", err)
+	}
+	cp2.Close()
+	if lines := arc.distinctLines(); len(lines) != nSeries {
+		t.Fatalf("distinct points = %d, want %d", len(lines), nSeries)
+	}
+}
+
+// TestResumeLegacyCheckpoint covers the pre-cursor (<= 0.1.4) checkpoint shape:
+// with the cursor NULLed, the resume must fall back to re-deriving and skipping
+// committed chunks — same end state, just the slow path.
+func TestResumeLegacyCheckpoint(t *testing.T) {
+	const nSeries = 60
+	datadir := writeTSMShard(t, "metrics", nSeries)
+
+	arc := &crashingArc{crashAfter: 3}
+	srv := httptest.NewServer(http.HandlerFunc(arc.handler))
+	defer srv.Close()
+
+	cpPath := filepath.Join(t.TempDir(), "cp.db")
+	shards, _ := discover.Walk(datadir, "", nil, false)
+	cfg := runConfig{shards: shards, start: math.MinInt64, end: math.MaxInt64, chunkSize: 256}
+	ctx := context.Background()
+
+	cp1, _ := checkpoint.Open(cpPath)
+	if _, err := load(ctx, cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp1); err == nil {
+		t.Fatal("expected first pass to fail at the simulated crash")
+	}
+	cp1.Close()
+
+	// Reshape to a legacy checkpoint (no cursor), then resume.
+	cpNull, _ := checkpoint.Open(cpPath)
+	if err := cpNull.ClearCursorsForTest(); err != nil {
+		t.Fatal(err)
+	}
+	cpNull.Close()
+
+	arc.crashAfter = -1
+	cp2, _ := checkpoint.Open(cpPath)
+	res, err := load(ctx, cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp2)
+	cp2.Close()
+	if err != nil {
+		t.Fatalf("legacy resume failed: %v", err)
+	}
+	if res.SkippedChunks != 3 {
+		t.Errorf("legacy resume skipped %d chunks, want 3 (re-derive path)", res.SkippedChunks)
+	}
+	if lines := arc.distinctLines(); len(lines) != nSeries {
+		t.Fatalf("distinct points = %d, want %d", len(lines), nSeries)
+	}
+	if overlap := arc.rows - nSeries; overlap != 0 {
+		t.Errorf("legacy resume produced overlap=%d, want 0", overlap)
+	}
+}
+
+// TestResumeSeekByteIdentical is the seek-correctness net: a crash + seek
+// resume must deliver to Arc EXACTLY the bytes an uninterrupted run delivers —
+// same chunk boundaries, same order, no gaps, no overlap.
+func TestResumeSeekByteIdentical(t *testing.T) {
+	const nSeries = 60
+	datadir := writeTSMShard(t, "metrics", nSeries)
+	shards, _ := discover.Walk(datadir, "", nil, false)
+	cfg := runConfig{shards: shards, start: math.MinInt64, end: math.MaxInt64, chunkSize: 256, pipeline: true}
+	ctx := context.Background()
+
+	// Reference: one uninterrupted run.
+	ref := &crashingArc{crashAfter: -1}
+	refSrv := httptest.NewServer(http.HandlerFunc(ref.handler))
+	defer refSrv.Close()
+	cpRef, _ := checkpoint.Open(filepath.Join(t.TempDir(), "ref.db"))
+	if _, err := load(ctx, cfg, sink.New(refSrv.URL, "tok", "ns", fastRetry()), cpRef); err != nil {
+		t.Fatal(err)
+	}
+	cpRef.Close()
+
+	// Crash after 3 accepted chunks, then seek-resume.
+	arc := &crashingArc{crashAfter: 3}
+	srv := httptest.NewServer(http.HandlerFunc(arc.handler))
+	defer srv.Close()
+	cpPath := filepath.Join(t.TempDir(), "cp.db")
+	cp1, _ := checkpoint.Open(cpPath)
+	if _, err := load(ctx, cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp1); err == nil {
+		t.Fatal("expected crash")
+	}
+	cp1.Close()
+	arc.crashAfter = -1
+	cp2, _ := checkpoint.Open(cpPath)
+	if _, err := load(ctx, cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp2); err != nil {
+		t.Fatalf("seek resume failed: %v", err)
+	}
+	cp2.Close()
+
+	if len(arc.acceptedLP) != len(ref.acceptedLP) {
+		t.Fatalf("chunk count: crash+resume delivered %d, uninterrupted %d", len(arc.acceptedLP), len(ref.acceptedLP))
+	}
+	for i := range ref.acceptedLP {
+		if !bytes.Equal(arc.acceptedLP[i], ref.acceptedLP[i]) {
+			t.Fatalf("chunk %d differs between seek resume and uninterrupted run", i)
+		}
 	}
 }

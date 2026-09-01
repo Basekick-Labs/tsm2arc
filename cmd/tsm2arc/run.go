@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 
 	"golang.org/x/sync/errgroup"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/basekick-labs/tsm2arc/internal/chunk"
 	"github.com/basekick-labs/tsm2arc/internal/discover"
 	"github.com/basekick-labs/tsm2arc/internal/extract"
+	"github.com/basekick-labs/tsm2arc/internal/lp"
 	"github.com/basekick-labs/tsm2arc/internal/measure"
 	"github.com/basekick-labs/tsm2arc/internal/sink"
 	"github.com/basekick-labs/tsm2arc/internal/tsm"
@@ -42,7 +44,7 @@ func runDryRun(ctx context.Context, cfg runConfig, sampleN int) {
 			actions: map[string]measure.Resolution{}, actPts: map[string]int64{}}
 		aggs[db] = ag
 		for _, sh := range byDB[db] {
-			forEachPoint(cfg, sh, func(p extract.Point) {
+			forEachPoint(cfg, sh, nil, func(p extract.Point) {
 				res := cfg.resolver.Resolve(p.Measurement)
 				if res.Action != measure.ActionPass {
 					ag.actions[p.Measurement] = res
@@ -261,6 +263,21 @@ type shardResult struct {
 // It is safe to run concurrently with other loadShard calls: each shard has its
 // own accumulator/sequence/result, and the checkpoint store and sink are
 // concurrency-safe. Progress is reported through prog (thread-safe).
+//
+// Resume takes one of two paths:
+//   - Seek (checkpoint has a cursor): extraction restarts at the cursor —
+//     series before it are never read, blocks at or before its timestamp are
+//     pruned from the index — and chunk numbering continues at committed+1.
+//     Nothing already acknowledged is re-derived.
+//   - Legacy (pre-cursor checkpoint): everything is re-derived and chunks with
+//     seq <= committed are skipped without being re-sent.
+//
+// Extraction and upload are pipelined (unless cfg.pipeline is off): the flush
+// callback hands the finished chunk to a sender goroutine and extraction
+// continues into the next chunk while the previous gzips, POSTs, and commits.
+// The sender is drained BEFORE the shard is marked done — a chunk still in
+// flight can fail, and a done mark without its acknowledgement would be data
+// loss on the next resume.
 func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoint.Store, sh discover.Shard, arcDB string, prog *progress) (shardResult, error) {
 	var r shardResult
 
@@ -282,44 +299,98 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 		return r, nil
 	}
 
-	committed, err := cp.CommittedSeq(cpKey, sh.ShardID)
+	committed, cur, err := cp.Progress(cpKey, sh.ShardID)
 	if err != nil {
 		return r, fmt.Errorf("checkpoint read (%s/%s): %w", label, sh.ShardID, err)
 	}
-	if committed >= 0 {
-		prog.logf("[%s/%s] resuming after committed chunk %d", label, sh.ShardID, committed)
+	startSeq := 0
+	var resumeCur *extract.Cursor
+	switch {
+	case committed >= 0 && cur != nil:
+		startSeq = committed + 1
+		resumeCur = &extract.Cursor{SeriesKey: cur.SeriesKey, UnixNano: cur.UnixNano}
+		prog.logf("[%s/%s] resuming: seeking past %d committed chunk(s) to the checkpoint cursor", label, sh.ShardID, committed+1)
+	case committed >= 0:
+		prog.logf("[%s/%s] resuming after committed chunk %d (pre-0.1.5 checkpoint: re-deriving and skipping %d chunk(s))",
+			label, sh.ShardID, committed, committed+1)
 	}
 
-	acc := chunk.New(cfg.chunkSize, func(ctx context.Context, seq int, lp []byte) error {
-		// Skip chunks already durably in Arc (re-derived but not re-sent).
+	var snd *sender
+	snd = newSender(ctx, cfg.pipeline, func(ctx context.Context, j sendJob) error {
+		sres, err := snk.Send(ctx, arcDB, j.lp)
+		if err != nil {
+			return fmt.Errorf("send %s/%s chunk %d to %q: %w", label, sh.ShardID, j.seq, arcDB, err)
+		}
+		// Commit AFTER 2xx — the durability barrier for resume. Cursor and audit
+		// deltas ride the same transaction, so they can never disagree with seq.
+		if err := cp.Commit(cpKey, sh.ShardID, j.seq, sres.Result.RowsImported, j.cur, j.deltas); err != nil {
+			return fmt.Errorf("checkpoint commit %s/%s chunk %d: %w", label, sh.ShardID, j.seq, err)
+		}
+		snd.sent++
+		snd.rows += sres.Result.RowsImported
+		prog.addChunk(int64(len(j.lp)), sres.Result.RowsImported)
+		prog.logf("[%s/%s] chunk %d: %d bytes raw → %d rows", label, sh.ShardID, j.seq, len(j.lp), sres.Result.RowsImported)
+		return nil
+	})
+	defer snd.wait() // never leak the sender goroutine on an error return
+
+	// Measurement resolution is cached per name: shards emit points grouped by
+	// series, so the same measurement string recurs in long runs.
+	//
+	// tally is the running point count per acted-on (renamed/skipped)
+	// measurement, in emission order. It is copy-on-write: a marker snapshots it
+	// by reference, and the next action clones before mutating, so a flush reads
+	// the counts as of the chunk's LAST line — skipped points that fall between
+	// that line and the flush belong to the NEXT chunk's delta (they are behind
+	// the next cursor, not this one, and a seek-resume would re-derive them).
+	resCache := map[string]measure.Resolution{}
+	var tally map[string]int64
+	tallyShared := false
+	bump := func(m string) {
+		if tally == nil || tallyShared {
+			nt := make(map[string]int64, len(tally)+1)
+			for k, v := range tally {
+				nt[k] = v
+			}
+			tally, tallyShared = nt, false
+		}
+		tally[m]++
+	}
+	// baseline is the tally as of the last committed (or resume-skipped) chunk;
+	// a chunk's delta is marker tally minus baseline.
+	var baseline map[string]int64
+
+	var acc *chunk.Accumulator
+	acc = chunk.NewAt(cfg.chunkSize, startSeq, func(ctx context.Context, seq int, lpBytes []byte, m chunk.Marker) error {
+		// Legacy resume: chunk already durably in Arc — re-derived, not re-sent.
+		// The baseline still advances so the first NEW chunk's audit delta only
+		// covers its own lines.
 		if seq <= committed {
 			r.skipped++
 			prog.addSkipped(1)
+			baseline = m.Tally
 			return nil
 		}
-		sres, err := snk.Send(ctx, arcDB, lp)
-		if err != nil {
-			return fmt.Errorf("send %s/%s chunk %d to %q: %w", label, sh.ShardID, seq, arcDB, err)
+		deltas := tallyDeltas(m.Tally, baseline, resCache)
+		baseline = m.Tally
+		if snd.pipelined {
+			// Reuse buffers the sender has finished with, then hand this one off.
+			for _, b := range snd.reclaim() {
+				acc.Recycle(b)
+			}
+			acc.Detach()
 		}
-		// Commit AFTER 2xx — this is the durability barrier for resume.
-		if err := cp.Commit(cpKey, sh.ShardID, seq, sres.Result.RowsImported); err != nil {
-			return fmt.Errorf("checkpoint commit %s/%s chunk %d: %w", label, sh.ShardID, seq, err)
-		}
-		r.sent++
-		r.rows += sres.Result.RowsImported
-		prog.addChunk(int64(len(lp)), sres.Result.RowsImported)
-		prog.logf("[%s/%s] chunk %d: %d bytes raw → %d rows", label, sh.ShardID, seq, len(lp), sres.Result.RowsImported)
-		return nil
+		return snd.submit(ctx, sendJob{
+			seq:    seq,
+			lp:     lpBytes,
+			cur:    checkpoint.Cursor{SeriesKey: m.SeriesKey, UnixNano: m.UnixNano},
+			deltas: deltas,
+		})
 	})
 
-	// Measurement resolution is cached per name: shards emit points grouped by
-	// series, so the same measurement string recurs in long runs. actPts tallies
-	// affected points per source measurement for the checkpoint audit record.
-	resCache := map[string]measure.Resolution{}
-	actPts := map[string]int64{}
-
+	scratch := make([]byte, 0, 64<<10) // reused per-line encode buffer
 	var appendErr error
-	_ = forEachPoint(cfg, sh, func(p extract.Point) {
+	extractErr := forEachPoint(cfg, sh, resumeCur, func(p extract.Point) {
 		if appendErr != nil {
 			return
 		}
@@ -341,56 +412,184 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 			appendErr = errInvalidMeasurement(p.Measurement)
 			return
 		case measure.ActionSkipped:
-			actPts[p.Measurement]++
+			bump(p.Measurement)
 			r.skippedPoints++
 			return
 		case measure.ActionRenamed, measure.ActionAutoRenamed:
-			actPts[p.Measurement]++
+			bump(p.Measurement)
 			p.Measurement = res.Name
 		}
-		appendErr = acc.Append(ctx, []byte(extract.EncodePoint(p)))
+		scratch = lp.AppendPoint(scratch[:0], p.Measurement, p.Tags, p.Fields, p.UnixNano)
+		appendErr = acc.Append(ctx, scratch, chunk.Marker{SeriesKey: p.SeriesKey, UnixNano: p.UnixNano, Tally: tally})
+		tallyShared = true
 	}, nil, prog)
 	if appendErr != nil {
 		return r, fmt.Errorf("load %s/%s: %w", label, sh.ShardID, appendErr)
+	}
+	if extractErr != nil {
+		return r, fmt.Errorf("load %s/%s: %w", label, sh.ShardID, extractErr)
 	}
 	if err := acc.Flush(ctx); err != nil {
 		return r, fmt.Errorf("final flush %s/%s: %w", label, sh.ShardID, err)
 	}
 
-	// Persist the shard's rename/skip audit records BEFORE marking it done, so
-	// a done shard always has its actions on record. Counts are deterministic
-	// per shard (extraction order is), so re-recording on a resume overwrites
-	// with identical values.
-	if len(actPts) > 0 {
-		acts := make([]checkpoint.MeasurementAction, 0, len(actPts))
-		for _, m := range sortedKeys(resCache) {
-			n, affected := actPts[m]
-			if !affected {
-				continue
-			}
-			a := checkpoint.MeasurementAction{Measurement: m, Points: n}
-			switch resCache[m].Action {
-			case measure.ActionSkipped:
-				a.Action = "skipped"
-			case measure.ActionRenamed:
-				a.Action, a.RenamedTo, a.Origin = "renamed", resCache[m].Name, "explicit"
-			case measure.ActionAutoRenamed:
-				a.Action, a.RenamedTo, a.Origin = "renamed", resCache[m].Name, "auto"
-			}
-			acts = append(acts, a)
-		}
-		if err := cp.RecordMeasurementActions(cpKey, sh.ShardID, acts); err != nil {
-			return r, fmt.Errorf("record measurement actions %s/%s: %w", label, sh.ShardID, err)
-		}
+	// Drain barrier: every submitted chunk must be acknowledged and committed
+	// before the shard can be marked done. A failed in-flight chunk fails the
+	// shard here; its progress up to the failure is already checkpointed.
+	if err := snd.wait(); err != nil {
+		return r, err
 	}
+	r.sent, r.rows = snd.sent, snd.rows
 
-	// All chunks for this shard acknowledged — mark it done so future resumes
-	// skip the whole shard (no re-extraction).
-	if err := cp.MarkShardDone(cpKey, sh.ShardID, acc.Seq(), r.rows); err != nil {
+	// Finish: trailing audit deltas (lines after the last chunk's cursor —
+	// e.g. skipped points that never entered a chunk) and the done mark commit
+	// in one transaction, so a done shard always has its complete audit trail.
+	if err := cp.FinishShard(cpKey, sh.ShardID, acc.Seq(), tallyDeltas(tally, baseline, resCache)); err != nil {
 		return r, fmt.Errorf("mark done %s/%s: %w", label, sh.ShardID, err)
 	}
 	prog.shardDone()
 	return r, nil
+}
+
+// sendJob is one finished chunk on its way to Arc: the raw LP, its sequence,
+// and the checkpoint state (cursor + audit deltas) to commit after the 2xx.
+type sendJob struct {
+	seq    int
+	lp     []byte
+	cur    checkpoint.Cursor
+	deltas []checkpoint.ActionDelta
+}
+
+// sender runs a shard's send+commit stage, either inline (submit blocks through
+// the whole POST) or pipelined behind a single goroutine (submit hands off and
+// returns; the unbuffered channel bounds the pipeline to one chunk in flight
+// while the next accumulates). A single goroutine keeps commits in seq order.
+type sender struct {
+	pipelined bool
+	process   func(context.Context, sendJob) error
+
+	jobs  chan sendJob
+	done  chan struct{}
+	spare chan []byte
+	once  sync.Once
+
+	mu  sync.Mutex
+	err error
+
+	// sent/rows are written by the sender goroutine (or inline submit) and read
+	// after wait() — the done channel orders that read.
+	sent, rows int64
+}
+
+func newSender(ctx context.Context, pipelined bool, process func(context.Context, sendJob) error) *sender {
+	s := &sender{pipelined: pipelined, process: process}
+	if !pipelined {
+		return s
+	}
+	s.jobs = make(chan sendJob)
+	s.done = make(chan struct{})
+	s.spare = make(chan []byte, 2)
+	go func() {
+		defer close(s.done)
+		for j := range s.jobs {
+			if s.takeErr() != nil {
+				continue // failed: drain remaining jobs so submit never deadlocks
+			}
+			if err := s.process(ctx, j); err != nil {
+				s.setErr(err)
+				continue
+			}
+			select {
+			case s.spare <- j.lp[:0]:
+			default:
+			}
+		}
+	}()
+	return s
+}
+
+// submit delivers one chunk. Inline mode processes it synchronously; pipelined
+// mode blocks only until the sender goroutine is free (depth-1 pipeline).
+func (s *sender) submit(ctx context.Context, j sendJob) error {
+	if !s.pipelined {
+		return s.process(ctx, j)
+	}
+	if err := s.takeErr(); err != nil {
+		return err
+	}
+	select {
+	case s.jobs <- j:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// reclaim returns buffers the sender has finished with (pipelined mode only).
+func (s *sender) reclaim() [][]byte {
+	var out [][]byte
+	for {
+		select {
+		case b := <-s.spare:
+			out = append(out, b)
+		default:
+			return out
+		}
+	}
+}
+
+// wait closes the pipeline, blocks until every submitted chunk is processed,
+// and returns the first error. Idempotent — also used as the error-path drain.
+func (s *sender) wait() error {
+	if s.pipelined {
+		s.once.Do(func() { close(s.jobs) })
+		<-s.done
+	}
+	return s.takeErr()
+}
+
+func (s *sender) setErr(err error) {
+	s.mu.Lock()
+	if s.err == nil {
+		s.err = err
+	}
+	s.mu.Unlock()
+}
+
+func (s *sender) takeErr() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+// tallyDeltas renders the difference between two copy-on-write tally snapshots
+// as checkpoint action deltas, in deterministic (sorted measurement) order.
+// base may be nil (shard start).
+func tallyDeltas(cur, base map[string]int64, resCache map[string]measure.Resolution) []checkpoint.ActionDelta {
+	if len(cur) == 0 {
+		return nil
+	}
+	ms := make([]string, 0, len(cur))
+	for m := range cur {
+		if cur[m] > base[m] {
+			ms = append(ms, m)
+		}
+	}
+	sort.Strings(ms)
+	out := make([]checkpoint.ActionDelta, 0, len(ms))
+	for _, m := range ms {
+		d := checkpoint.ActionDelta{Measurement: m, Points: cur[m] - base[m]}
+		switch res := resCache[m]; res.Action {
+		case measure.ActionSkipped:
+			d.Action = "skipped"
+		case measure.ActionRenamed:
+			d.Action, d.RenamedTo, d.Origin = "renamed", res.Name, "explicit"
+		case measure.ActionAutoRenamed:
+			d.Action, d.RenamedTo, d.Origin = "renamed", res.Name, "auto"
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 // errInvalidMeasurement is the client-side replacement for Arc's mid-load 400:
@@ -409,13 +608,15 @@ func errInvalidMeasurement(name string) error {
 func openTSM(path string) (extract.TSMFile, error) { return tsm.Open(path) }
 
 // forEachPoint iterates every reconstructed point of a shard, field-rejoining
-// across the shard's TSM files AND its WAL files (deterministic order). onPoint
-// is called per point (may be nil); onShardStats is called once with the shard's
-// combined stats (may be nil). prog, if non-nil, receives a thread-safe verbose
-// line (used by the concurrent load path; dry-run passes nil and logs itself).
-// A hard decode error aborts via the returned error; truncated WAL tails are
-// tolerated inside the WAL reader.
-func forEachPoint(cfg runConfig, sh discover.Shard, onPoint func(extract.Point), onShardStats func(extract.Stats), prog *progress) error {
+// across the shard's TSM files AND its WAL files (deterministic order). cur, if
+// non-nil, seeks extraction past everything at or before it (see
+// extract.ShardResume). onPoint is called per point (may be nil; the point's
+// Fields are only valid during the call); onShardStats is called once with the
+// shard's combined stats (may be nil). prog, if non-nil, receives a thread-safe
+// verbose line (used by the concurrent load path; dry-run passes nil and logs
+// itself). A hard decode error aborts via the returned error; truncated WAL
+// tails are tolerated inside the WAL reader.
+func forEachPoint(cfg runConfig, sh discover.Shard, cur *extract.Cursor, onPoint func(extract.Point), onShardStats func(extract.Stats), prog *progress) error {
 	if prog != nil {
 		prog.logf("shard %s/%s/%s: %d tsm + %d wal file(s)",
 			sh.Database, sh.Retention, sh.ShardID, len(sh.TSMFiles), len(sh.WALFiles))
@@ -423,8 +624,8 @@ func forEachPoint(cfg runConfig, sh discover.Shard, onPoint func(extract.Point),
 		fmt.Printf("  shard %s/%s/%s: %d tsm + %d wal file(s)\n",
 			sh.Database, sh.Retention, sh.ShardID, len(sh.TSMFiles), len(sh.WALFiles))
 	}
-	st, err := extract.Shard(sh.TSMFiles, sh.WALFiles, openTSM, wal.ReadFile,
-		cfg.start, cfg.end, func(p extract.Point) {
+	st, err := extract.ShardResume(sh.TSMFiles, sh.WALFiles, openTSM, wal.ReadFile,
+		cfg.start, cfg.end, cur, func(p extract.Point) {
 			if onPoint != nil {
 				onPoint(p)
 			}

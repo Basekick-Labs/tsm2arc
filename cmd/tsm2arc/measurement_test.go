@@ -145,7 +145,7 @@ func newMeasurementTestEnv(t *testing.T, resolver *measure.Resolver) (runConfig,
 		t.Fatal(err)
 	}
 	cfg := runConfig{shards: shards, start: math.MinInt64, end: math.MaxInt64,
-		chunkSize: 1 << 20, resolver: resolver}
+		chunkSize: 1 << 20, resolver: resolver, pipeline: true}
 	cpPath := filepath.Join(t.TempDir(), "cp.db")
 	return cfg, arc, srv, cpPath
 }
@@ -296,6 +296,62 @@ func TestLoadExplicitMap(t *testing.T) {
 	for _, r := range rows {
 		if r.Action != "renamed" || r.Origin != "explicit" {
 			t.Errorf("bad explicit record: %+v", r)
+		}
+	}
+}
+
+// TestSkipAuditExactAcrossSeekResume: the checkpoint's skip/rename counts must
+// come out EXACT after a crash + seek resume — the resumed run only sees the
+// tail, so the counts survive via per-chunk deltas, not end-of-shard rewrites.
+func TestSkipAuditExactAcrossSeekResume(t *testing.T) {
+	resolver, _ := measure.NewResolver(nil, measure.PolicySkip)
+	datadir := writeTSMShardMeasurements(t, "metrics", testMeasurements, 3)
+	arc := &crashingArc{crashAfter: 2} // accept 2 chunks, then fail
+	srv := httptest.NewServer(http.HandlerFunc(arc.handler))
+	defer srv.Close()
+	shards, err := discover.Walk(datadir, "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ~50-byte lines, chunk=64 → one line per chunk → 6 chunks of valid lines.
+	cfg := runConfig{shards: shards, start: math.MinInt64, end: math.MaxInt64,
+		chunkSize: 64, resolver: resolver, pipeline: true}
+	cpPath := filepath.Join(t.TempDir(), "cp.db")
+	ctx := context.Background()
+
+	cp1, _ := checkpoint.Open(cpPath)
+	if _, err := load(ctx, cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp1); err == nil {
+		t.Fatal("expected crash")
+	}
+	cp1.Close()
+
+	arc.crashAfter = -1
+	cp2, _ := checkpoint.Open(cpPath)
+	res, err := load(ctx, cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp2)
+	if err != nil {
+		t.Fatalf("seek resume failed: %v", err)
+	}
+	if res.SkippedChunks != 0 {
+		t.Errorf("seek resume re-derived %d chunks, want 0", res.SkippedChunks)
+	}
+
+	// No loss, no duplication of the valid lines...
+	if lines := arc.distinctLines(); len(lines) != 6 || arc.rows != 6 {
+		t.Errorf("valid lines: distinct=%d total=%d, want 6/6", len(lines), arc.rows)
+	}
+	// ...and the audit counts are exact: two skipped measurements, 3 points each,
+	// counted once despite the crash landing mid-shard.
+	rows, err := cp2.MeasurementReport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp2.Close()
+	if len(rows) != 2 {
+		t.Fatalf("report rows = %d, want 2: %+v", len(rows), rows)
+	}
+	for _, r := range rows {
+		if r.Action != "skipped" || r.Points != 3 {
+			t.Errorf("audit not exact across seek resume: %+v (want skipped/3)", r)
 		}
 	}
 }
