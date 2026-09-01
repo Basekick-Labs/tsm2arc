@@ -173,8 +173,8 @@ func TestParallelLoadCorrectness(t *testing.T) {
 		shards:    shards,
 		start:     math.MinInt64,
 		end:       math.MaxInt64,
-		chunkSize: 256, // many chunks per shard
-		workers:   4,   // real concurrency
+		chunkSize: 256,  // many chunks per shard
+		workers:   4,    // real concurrency
 		pipeline:  true, // production default: senders overlap extraction
 	}
 
