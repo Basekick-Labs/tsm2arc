@@ -175,6 +175,7 @@ func TestParallelLoadCorrectness(t *testing.T) {
 		end:       math.MaxInt64,
 		chunkSize: 256, // many chunks per shard
 		workers:   4,   // real concurrency
+		pipeline:  true, // production default: senders overlap extraction
 	}
 
 	res, err := load(context.Background(), cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp)

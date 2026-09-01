@@ -5,7 +5,10 @@ import (
 	"testing"
 )
 
-func TestMeasurementActions(t *testing.T) {
+// Action deltas ride chunk commits (and FinishShard for the trailing window)
+// and ACCUMULATE: the audit trail must stay exact across seek-resumes, where a
+// resumed run only ever sees — and re-counts — the un-committed tail.
+func TestMeasurementActionDeltas(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "cp.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -18,17 +21,29 @@ func TestMeasurementActions(t *testing.T) {
 		t.Fatalf("empty report: %v rows, err=%v", rows, err)
 	}
 
-	acts := []MeasurementAction{
-		{Measurement: "edge-prod.gateway", Action: "renamed", RenamedTo: "edge_prod_gateway", Origin: "explicit", Points: 100},
-		{Measurement: "test.skip_me", Action: "skipped", Points: 7},
+	rename := func(pts int64) ActionDelta {
+		return ActionDelta{Measurement: "edge-prod.gateway", Action: "renamed",
+			RenamedTo: "edge_prod_gateway", Origin: "explicit", Points: pts}
 	}
-	if err := s.RecordMeasurementActions("metrics", "1", acts); err != nil {
+	skip := func(pts int64) ActionDelta {
+		return ActionDelta{Measurement: "test.skip_me", Action: "skipped", Points: pts}
+	}
+
+	// Shard 1: two chunk commits carrying deltas, then trailing deltas at finish.
+	if err := s.Commit("metrics", "1", 0, 10, Cursor{SeriesKey: "a", UnixNano: 1},
+		[]ActionDelta{rename(60), skip(2)}); err != nil {
 		t.Fatal(err)
 	}
-	// same measurement in a second shard aggregates
-	if err := s.RecordMeasurementActions("metrics", "2", []MeasurementAction{
-		{Measurement: "edge-prod.gateway", Action: "renamed", RenamedTo: "edge_prod_gateway", Origin: "explicit", Points: 50},
-	}); err != nil {
+	if err := s.Commit("metrics", "1", 1, 10, Cursor{SeriesKey: "a", UnixNano: 2},
+		[]ActionDelta{rename(40)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishShard("metrics", "1", 2, []ActionDelta{skip(5)}); err != nil {
+		t.Fatal(err)
+	}
+	// Shard 2: same measurement aggregates across shards in the report.
+	if err := s.Commit("metrics", "2", 0, 10, Cursor{SeriesKey: "a", UnixNano: 1},
+		[]ActionDelta{rename(50)}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -48,18 +63,15 @@ func TestMeasurementActions(t *testing.T) {
 		t.Errorf("skipped row = %+v", r)
 	}
 
-	// Re-recording a shard (deterministic re-derive on resume) OVERWRITES its
-	// counts instead of accumulating — no double-counting.
-	if err := s.RecordMeasurementActions("metrics", "1", acts); err != nil {
+	// nil/empty delta sets are no-ops
+	if err := s.Commit("metrics", "1", 2, 0, Cursor{SeriesKey: "a", UnixNano: 3}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FinishShard("metrics", "1", 3, nil); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ = s.MeasurementReport()
-	if rows[0].Points != 150 {
-		t.Errorf("after re-record, renamed points = %d, want 150 (overwrite, not accumulate)", rows[0].Points)
-	}
-
-	// nil/empty batch is a no-op
-	if err := s.RecordMeasurementActions("metrics", "1", nil); err != nil {
-		t.Fatal(err)
+	if rows[0].Points != 150 || rows[1].Points != 7 {
+		t.Errorf("no-op commits changed counts: %+v", rows)
 	}
 }

@@ -89,12 +89,19 @@ func (p *progress) printStatus(prefix string) {
 	}
 	rows := p.rows.Load()
 	mb := float64(p.bytes.Load()) / (1024 * 1024)
+	// A resume that is skipping already-sent chunks must say so: without the
+	// skipped counter the heartbeat reads "0 chunks, 0 rows" for the whole
+	// catch-up phase and is indistinguishable from a hang.
+	skipped := ""
+	if n := p.skipped.Load(); n > 0 {
+		skipped = fmt.Sprintf(" (+%d skipped on resume)", n)
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	fmt.Printf("%s[%d/%d shards] %d chunks, %d rows, %.1f MB raw — %.0f rows/s, %.1f MB/s (%.0fs)\n",
+	fmt.Printf("%s[%d/%d shards] %d chunks%s, %d rows, %.1f MB raw — %.0f rows/s, %.1f MB/s (%.0fs)\n",
 		prefix,
 		p.shardsDone.Load(), p.totalShards,
-		p.chunks.Load(), rows, mb,
+		p.chunks.Load(), skipped, rows, mb,
 		float64(rows)/elapsed, mb/elapsed, elapsed)
 }
 

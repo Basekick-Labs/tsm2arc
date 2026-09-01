@@ -118,6 +118,9 @@ natural root and it resolves the rest:
 #   --precision ns|us|ms|s   precision value sent to Arc (default ns; tsm2arc always emits ns)
 #   --include-internal       also migrate InfluxDB 1.x's _internal database
 #                            (2.x system buckets _monitoring/_tasks are always skipped)
+#   --pipeline               overlap extraction with upload (default true; =false
+#                            reverts to serial send and saves one chunk buffer
+#                            of memory per worker)
 #   --dry-run                extract + count, do not write to Arc
 #   --sample N               print N sample LP lines per DB in --dry-run (default 5)
 #   --verbose                per-shard / per-chunk logging
@@ -275,8 +278,16 @@ If a migration is interrupted — process killed, network drop, host reboot — 
 **re-run the exact same command**. tsm2arc:
 
 - skips any shard already fully migrated (no re-extraction),
-- for a partially-migrated shard, re-derives its chunks deterministically and
-  resumes sending from the first un-acknowledged chunk.
+- for a partially-migrated shard, **seeks straight to where it left off**: the
+  checkpoint stores a cursor (series + timestamp of the last acknowledged line),
+  so series before it are never read, already-sent TSM blocks are skipped at the
+  index without being decoded, and sending resumes from the first
+  un-acknowledged chunk within seconds to minutes.
+
+A checkpoint written by tsm2arc ≤ 0.1.4 has no cursor; those shards resume the
+old way (re-derive deterministically, skip already-sent chunks without
+re-sending — the heartbeat shows the catch-up as `+N skipped on resume`). After
+one 0.1.5 commit the shard has a cursor and later resumes seek.
 
 Because chunk boundaries are a deterministic function of a shard's extraction
 order and `--chunk-bytes`, a resumed shard produces byte-identical chunks, so the
