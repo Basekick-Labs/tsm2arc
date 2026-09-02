@@ -512,26 +512,56 @@ type Cursor struct {
 // changed since the cursor was written, and ShardResume fails loudly rather
 // than silently mis-aligning.
 func ShardResume(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, start, end int64, cur *Cursor, fn func(Point)) (Stats, error) {
-	var st Stats
+	return ShardResumeSplit(tsmFiles, walFiles, openTSM, readWAL, start, end, cur, SplitOptions{}, fn)
+}
 
-	// 1) Index each TSM file's KEY STRINGS, then CLOSE it. We deliberately do NOT
-	//    hold all readers open through this pass: a shard can have many TSM files
-	//    and that would risk exhausting the file-descriptor limit at scale. Values
-	//    are read later by re-opening the relevant file per series (TSM open just
-	//    reads the footer + index — cheap). For each series we record which file
-	//    indices hold its keys.
+// SplitOptions controls intra-shard parallelism. The zero value (Workers <= 1)
+// is the serial path — the exact 0.1.5 code, bypassing the split machinery
+// entirely. Workers > 1 extracts a shard with concurrent window-merge tasks
+// while emitting BYTE-IDENTICAL output in the identical order (see split.go);
+// because output is unchanged, these options are pure performance knobs: they
+// are not part of the resume fingerprint and may change between runs, including
+// between a crash and its resume.
+type SplitOptions struct {
+	// Workers is the maximum number of concurrent merge tasks.
+	Workers int
+	// MemoryBudget bounds the estimated decoded-block footprint of concurrently
+	// admitted tasks. Required (> 0) when Workers > 1: worker count alone is not
+	// a safe knob — a single window over fully overlapping generations can hold
+	// one decoded block per (file × field). A task whose estimate exceeds the
+	// whole budget runs alone, degrading to the serial memory profile.
+	MemoryBudget int64
+}
+
+// shardIndex is the phase-1/2 product shared by the serial and split paths:
+// which series exist, which files hold them (with time ranges), and the WAL
+// values per series.
+type shardIndex struct {
+	seriesOrder      []string
+	keysBySeriesFile map[string]map[int]*fileKeys
+	walBySeries      map[string][]walStream
+}
+
+// indexShard runs the index pass (phase 1) and WAL load (phase 2).
+//
+// Phase 1 opens each TSM file's KEY STRINGS, then CLOSEs it. We deliberately do
+// NOT hold all readers open through this pass: a shard can have many TSM files
+// and that would risk exhausting the file-descriptor limit at scale. Values are
+// read later by re-opening the relevant file per series (TSM open just reads
+// the footer + index — cheap, and cheaper still behind an index cache). For
+// each series we record which file indices hold its keys and the time range
+// they span — the range comes free from the block index and lets phase 3 avoid
+// holding files open whose data cannot interleave (see partitionRuns).
+func indexShard(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, st *Stats) (*shardIndex, error) {
+	si := &shardIndex{
+		keysBySeriesFile: map[string]map[int]*fileKeys{},
+		walBySeries:      map[string][]walStream{},
+	}
 	seen := map[string]struct{}{}
-	var seriesOrder []string
-	// series key → file index → that series' keys in that file, plus the time
-	// range they span. Stores only key STRINGS and two int64s during indexing
-	// (cheap); values are read later. The range comes free from the block index
-	// we have already parsed, and lets phase 3 avoid holding files open whose
-	// data cannot interleave (see partitionRuns).
-	keysBySeriesFile := map[string]map[int]*fileKeys{}
 	for fi, tf := range tsmFiles {
 		r, err := openTSM(tf)
 		if err != nil {
-			return st, err
+			return nil, err
 		}
 		for _, raw := range r.Keys() {
 			k, perr := series.ParseKey(raw)
@@ -541,12 +571,12 @@ func ShardResume(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader
 			}
 			if _, ok := seen[k.SeriesKey]; !ok {
 				seen[k.SeriesKey] = struct{}{}
-				seriesOrder = append(seriesOrder, k.SeriesKey)
+				si.seriesOrder = append(si.seriesOrder, k.SeriesKey)
 			}
-			byFile := keysBySeriesFile[k.SeriesKey]
+			byFile := si.keysBySeriesFile[k.SeriesKey]
 			if byFile == nil {
 				byFile = map[int]*fileKeys{}
-				keysBySeriesFile[k.SeriesKey] = byFile
+				si.keysBySeriesFile[k.SeriesKey] = byFile
 			}
 			fk := byFile[fi]
 			if fk == nil {
@@ -566,8 +596,6 @@ func ShardResume(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader
 		r.Close()
 	}
 
-	// 2) Load the WAL (small) into per-series field streams once.
-	walBySeries := map[string][]walStream{}
 	for _, wf := range walFiles {
 		if err := readWAL(wf, func(key string, vals []tsm.Value) {
 			k, perr := series.ParseKey(key)
@@ -577,32 +605,75 @@ func ShardResume(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader
 			}
 			if _, ok := seen[k.SeriesKey]; !ok {
 				seen[k.SeriesKey] = struct{}{}
-				seriesOrder = append(seriesOrder, k.SeriesKey)
+				si.seriesOrder = append(si.seriesOrder, k.SeriesKey)
 			}
-			walBySeries[k.SeriesKey] = append(walBySeries[k.SeriesKey], walStream{field: k.Field, vals: vals})
+			si.walBySeries[k.SeriesKey] = append(si.walBySeries[k.SeriesKey], walStream{field: k.Field, vals: vals})
 		}); err != nil {
-			return st, err
+			return nil, err
 		}
 	}
+	return si, nil
+}
 
-	// 3) Emit series in sorted order. Each series' fields become lazy cursors over
-	//    the file(s) holding them; the merge pulls one block at a time, so only
-	//    the blocks currently being merged are resident.
+// applyCursor sorts the series order and, given a resume cursor, drops every
+// series wholly before it. The cursor series must be present — a shard whose
+// series set changed since the cursor was written cannot be resumed by
+// position.
+func (si *shardIndex) applyCursor(cur *Cursor) error {
+	sort.Strings(si.seriesOrder)
+	if cur == nil {
+		return nil
+	}
+	i := sort.SearchStrings(si.seriesOrder, cur.SeriesKey)
+	if i == len(si.seriesOrder) || si.seriesOrder[i] != cur.SeriesKey {
+		return fmt.Errorf("resume cursor series %q not found in shard: source data changed since the checkpoint was written", cur.SeriesKey)
+	}
+	si.seriesOrder = si.seriesOrder[i:]
+	return nil
+}
+
+// seriesStartFor returns the effective lower time bound for one series under a
+// resume cursor, and whether the series has anything left to emit. Timestamps
+// within a series are strictly ascending and unique, so cursor.UnixNano+1 is an
+// exact boundary; MaxInt64 marks the series fully delivered (+1 would overflow).
+func seriesStartFor(sk string, start int64, cur *Cursor) (int64, bool) {
+	if cur == nil || sk != cur.SeriesKey {
+		return start, true
+	}
+	if cur.UnixNano == math.MaxInt64 {
+		return 0, false
+	}
+	if s := cur.UnixNano + 1; s > start {
+		return s, true
+	}
+	return start, true
+}
+
+// ShardResumeSplit is ShardResume with intra-shard parallelism options. Output
+// is byte-identical across every SplitOptions value; see SplitOptions.
+func ShardResumeSplit(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, start, end int64, cur *Cursor, opt SplitOptions, fn func(Point)) (Stats, error) {
+	var st Stats
+	si, err := indexShard(tsmFiles, walFiles, openTSM, readWAL, &st)
+	if err != nil {
+		return st, err
+	}
+	if err := si.applyCursor(cur); err != nil {
+		return st, err
+	}
+
+	if opt.Workers > 1 {
+		return shardParallel(si, tsmFiles, openTSM, start, end, cur, opt, st, fn)
+	}
+
+	// Serial path (the 0.1.5 behavior, untouched): emit series in sorted order.
+	// Each series' fields become lazy cursors over the file(s) holding them; the
+	// merge pulls one block at a time, so only the blocks currently being merged
+	// are resident.
 	fs := newFileSet(tsmFiles, openTSM)
 	defer fs.closeAll()
 
-	sort.Strings(seriesOrder)
-	if cur != nil {
-		// Seek: drop every series wholly before the cursor. The cursor series
-		// must be present — a shard whose series set changed since the cursor was
-		// written cannot be resumed by position.
-		i := sort.SearchStrings(seriesOrder, cur.SeriesKey)
-		if i == len(seriesOrder) || seriesOrder[i] != cur.SeriesKey {
-			return st, fmt.Errorf("resume cursor series %q not found in shard: source data changed since the checkpoint was written", cur.SeriesKey)
-		}
-		seriesOrder = seriesOrder[i:]
-	}
-	for _, sk := range seriesOrder {
+	keysBySeriesFile, walBySeries := si.keysBySeriesFile, si.walBySeries
+	for _, sk := range si.seriesOrder {
 		// Within the cursor series, resume from the next timestamp; block pruning
 		// (pruneEntries / sliceStream filtering) then skips everything already
 		// delivered. Timestamps within a series are strictly ascending and unique,

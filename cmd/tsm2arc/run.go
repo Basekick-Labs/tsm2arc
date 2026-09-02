@@ -617,8 +617,10 @@ func openTSM(path string) (extract.TSMFile, error) { return tsm.Open(path) }
 // The cache is created per shard extraction and freed with it, so the budget
 // is per in-flight shard (× --workers shards concurrently). Files past the
 // budget simply fall back to a full parse — graceful degradation, no eviction.
-// NOT safe for concurrent use; each shard goroutine owns its own cache.
+// Safe for concurrent use: with --shard-split > 1 the extraction's window
+// tasks open files from worker goroutines.
 type indexCache struct {
+	mu     sync.Mutex
 	budget int64
 	used   int64
 	idx    map[string]*tsm.Index
@@ -633,20 +635,31 @@ func newIndexCache(budget int64) *indexCache {
 
 // open is the extract.OpenTSM implementation.
 func (c *indexCache) open(path string) (extract.TSMFile, error) {
-	if ix, ok := c.idx[path]; ok {
+	c.mu.Lock()
+	ix, ok := c.idx[path]
+	if ok {
 		c.hits++
+	}
+	c.mu.Unlock()
+	if ok {
 		return tsm.OpenWithIndex(path, ix)
 	}
+	// Parse outside the lock — concurrent first-opens of the same file may both
+	// parse (harmless; last one wins the cache slot).
 	r, err := tsm.Open(path)
 	if err != nil {
 		return nil, err
 	}
+	c.mu.Lock()
 	c.parses++
 	c.files[path] = struct{}{}
 	if ix := r.Index(); c.budget > 0 && c.used+ix.ApproxBytes() <= c.budget {
-		c.idx[path] = ix
-		c.used += ix.ApproxBytes()
+		if _, dup := c.idx[path]; !dup {
+			c.idx[path] = ix
+			c.used += ix.ApproxBytes()
+		}
 	}
+	c.mu.Unlock()
 	return r, nil
 }
 
@@ -691,8 +704,8 @@ func forEachPoint(cfg runConfig, sh discover.Shard, cur *extract.Cursor, onPoint
 			sh.Database, sh.Retention, sh.ShardID, len(sh.TSMFiles), len(sh.WALFiles))
 	}
 	cache := newIndexCache(cfg.indexCache)
-	st, err := extract.ShardResume(sh.TSMFiles, sh.WALFiles, cache.open, wal.ReadFile,
-		cfg.start, cfg.end, cur, func(p extract.Point) {
+	st, err := extract.ShardResumeSplit(sh.TSMFiles, sh.WALFiles, cache.open, wal.ReadFile,
+		cfg.start, cfg.end, cur, cfg.split, func(p extract.Point) {
 			if onPoint != nil {
 				onPoint(p)
 			}

@@ -188,6 +188,15 @@ Per-chunk is the natural atomic unit because the chunk is what Arc accepts atomi
 ### Measurement-action audit under seek
 Rename/skip point counts ride each chunk's commit as **accumulating deltas** in the same transaction as the seq/cursor (trailing counts — e.g. skipped points after the last chunk's cursor — commit with the done mark). A delta covers exactly the lines ordered at or before its chunk's cursor, so a seek-resume, which re-derives only the tail, re-counts only what was never committed: the audit stays exact across any number of crashes. (Before 0.1.5 counts were overwritten once at shard end, which relied on full re-derivation; opening an old checkpoint migrates it, dropping any orphaned in-progress action rows.)
 
+### Intra-shard parallelism (`--shard-split`)
+The shard's work decomposes into an ordered task list (series → time-ordered runs → large runs split into disjoint, inclusive time windows chosen from block-index boundaries). N workers merge tasks concurrently; a single consumer re-emits completed tasks strictly in list order through the normal callback, so output is **byte-identical** to serial extraction and `--shard-split`/`--merge-memory` stay OUT of the resume fingerprint (changeable between a crash and its resume, both directions — test-asserted).
+
+Two invariants (do not weaken):
+1. **Window membership is a pure function of timestamp.** Windows are inclusive, disjoint, integer-partitioned (`[prev+1, split]`); block entries only choose split points and prune I/O, and a block spanning a boundary is decoded by both adjacent tasks, each filtering by timestamp. TSM legally repeats a timestamp at the edge of two adjacent blocks — assigning *blocks* to windows would emit that point twice.
+2. **Admission is strict head-of-line against a memory budget.** A concurrent merge holds ~one decoded block per (file × field) stream, so worker count alone cannot bound memory. Tasks are admitted strictly in order; budget is released at task retirement (consumer done); a task whose estimate exceeds the whole budget waits for an empty budget and runs alone — the serial memory profile, never a deadlock.
+
+Runs containing a non-ascending key (the whole-key fallback path) are never windowed, and shared state (per-file key order, WAL slices — pre-sorted) is made read-only before workers exist.
+
 ### Extraction/upload pipeline
 The flush path hands each finished chunk to a per-shard sender goroutine (depth 1) and extraction continues into the next chunk while the previous gzips, POSTs, and commits. Commits stay in seq order (single sender); the sender is **drained before the shard's done mark** so a failed in-flight chunk fails the shard instead of being silently lost. `--pipeline=false` reverts to serial send; the cost of the default is one extra chunk buffer per worker.
 
