@@ -31,7 +31,7 @@ func TestBooleanDecodeClampsHugeCount(t *testing.T) {
 // of the file must be rejected before allocating e.Size bytes.
 func TestReadKeyRejectsOversizedBlock(t *testing.T) {
 	r := &Reader{
-		size: 100, // pretend the file is 100 bytes
+		ix: &Index{size: 100}, // pretend the file is 100 bytes
 	}
 	kb := keyBlocks{
 		Key:  "m#!~#f",

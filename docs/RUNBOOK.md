@@ -123,6 +123,20 @@ whether you passed `--waldir`.
 
 ---
 
+## 2a. Profile the shards (optional, seconds)
+
+`--analyze` reads only the TSM indexes — no data is decoded, nothing is sent —
+and prints per shard: series/file/key counts and, for the largest merge runs,
+whether the files' time ranges overlap fully or partition well. Run it when
+discussing throughput with support: the profile determines which optimizations
+can help your data shape.
+
+```bash
+tsm2arc --datadir /mnt/influx/data --analyze
+```
+
+---
+
 ## 3. Scope the migration (optional)
 
 You can migrate a subset first to validate the round-trip end to end:
@@ -256,6 +270,12 @@ Separately from the Arc node, watch the **migration host's** own RAM:
   dominates, and these are the only migration-host knobs worth turning. If the
   host is memory constrained, lower `--chunk-bytes` and/or `--workers` — none of
   the three affects correctness or resume.
+- **The index cache adds a bounded budget**: each in-flight shard caches parsed
+  TSM file indexes (up to `--index-cache`, default 2 GiB) so per-series file
+  reopens don't re-parse them. Worst case adds `workers × index-cache` to the
+  host budget; shards with small indexes use far less. If the run prints
+  "budget full; raise --index-cache", the shard's indexes exceed the budget and
+  extraction is paying re-parse CPU — raise it if the host has headroom.
 - **File descriptors**: extraction holds one handle per TSM file containing the
   series currently being merged. Files with non-overlapping time ranges are
   merged in separate passes, so this is normally one or two. If every file in a

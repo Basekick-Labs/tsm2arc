@@ -607,6 +607,72 @@ func errInvalidMeasurement(name string) error {
 // openTSM adapts tsm.Open to extract.OpenTSM (returns the interface type).
 func openTSM(path string) (extract.TSMFile, error) { return tsm.Open(path) }
 
+// indexCache is a per-shard cache of parsed TSM indexes. Extraction re-opens
+// each file once per (series, run), and every tsm.Open re-parses the file's
+// ENTIRE index — all series' keys, not just the one being read — so on shards
+// with many series the reopen cost scales with series × files of pure CPU
+// against bytes that are already in the page cache. Caching the parsed index
+// makes a reopen an open(2)+stat.
+//
+// The cache is created per shard extraction and freed with it, so the budget
+// is per in-flight shard (× --workers shards concurrently). Files past the
+// budget simply fall back to a full parse — graceful degradation, no eviction.
+// NOT safe for concurrent use; each shard goroutine owns its own cache.
+type indexCache struct {
+	budget int64
+	used   int64
+	idx    map[string]*tsm.Index
+	files  map[string]struct{} // distinct files seen
+	parses int                 // full index parses performed
+	hits   int                 // reopens served from cache
+}
+
+func newIndexCache(budget int64) *indexCache {
+	return &indexCache{budget: budget, idx: map[string]*tsm.Index{}, files: map[string]struct{}{}}
+}
+
+// open is the extract.OpenTSM implementation.
+func (c *indexCache) open(path string) (extract.TSMFile, error) {
+	if ix, ok := c.idx[path]; ok {
+		c.hits++
+		return tsm.OpenWithIndex(path, ix)
+	}
+	r, err := tsm.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	c.parses++
+	c.files[path] = struct{}{}
+	if ix := r.Index(); c.budget > 0 && c.used+ix.ApproxBytes() <= c.budget {
+		c.idx[path] = ix
+		c.used += ix.ApproxBytes()
+	}
+	return r, nil
+}
+
+// report logs cache effectiveness after a shard finishes; when the budget
+// forced fallback re-parses, it says so visibly (the whole point of the cache
+// is avoiding those).
+func (c *indexCache) report(shardLabel string, prog *progress, verbose bool) {
+	cached, total := len(c.idx), len(c.files)
+	line := fmt.Sprintf("[%s] index cache: %d/%d file indexes cached (%.1f MiB), %d parses, %d cached reopens",
+		shardLabel, cached, total, float64(c.used)/(1<<20), c.parses, c.hits)
+	if cached < total && c.budget > 0 {
+		line += " — budget full; raise --index-cache to avoid re-parsing the rest"
+		if prog != nil {
+			prog.notef("%s", line)
+		} else {
+			fmt.Println("  " + line)
+		}
+		return
+	}
+	if prog != nil {
+		prog.logf("%s", line)
+	} else if verbose {
+		fmt.Println("  " + line)
+	}
+}
+
 // forEachPoint iterates every reconstructed point of a shard, field-rejoining
 // across the shard's TSM files AND its WAL files (deterministic order). cur, if
 // non-nil, seeks extraction past everything at or before it (see
@@ -624,12 +690,14 @@ func forEachPoint(cfg runConfig, sh discover.Shard, cur *extract.Cursor, onPoint
 		fmt.Printf("  shard %s/%s/%s: %d tsm + %d wal file(s)\n",
 			sh.Database, sh.Retention, sh.ShardID, len(sh.TSMFiles), len(sh.WALFiles))
 	}
-	st, err := extract.ShardResume(sh.TSMFiles, sh.WALFiles, openTSM, wal.ReadFile,
+	cache := newIndexCache(cfg.indexCache)
+	st, err := extract.ShardResume(sh.TSMFiles, sh.WALFiles, cache.open, wal.ReadFile,
 		cfg.start, cfg.end, cur, func(p extract.Point) {
 			if onPoint != nil {
 				onPoint(p)
 			}
 		})
+	cache.report(sh.Database+"/"+sh.ShardID, prog, cfg.verbose)
 	if err != nil {
 		return err
 	}

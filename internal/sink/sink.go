@@ -15,10 +15,10 @@ package sink
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	gzip "github.com/klauspost/pgzip"
 	"io"
 	"math/rand"
 	"mime/multipart"
@@ -188,6 +188,12 @@ func (s *Sink) backoff(attempt int) time.Duration {
 }
 
 // buildMultipartGzip wraps gzipped lp in a multipart body with field "file".
+//
+// Compression uses pgzip (parallel gzip): a 450 MB chunk gzipped on one core
+// sits directly on the ack path between flush and POST, and migration hosts
+// have idle cores to burn. The compressed bytes differ from stdlib gzip's, but
+// compressed form was never part of any contract — chunk identity and resume
+// are defined over the RAW LP; Arc just gunzips whatever arrives.
 func buildMultipartGzip(lp []byte) (body []byte, contentType string, err error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
