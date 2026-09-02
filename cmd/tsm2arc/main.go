@@ -112,6 +112,7 @@ func main() {
 		sampleN      = flag.Int("sample", 5, "print up to N sample LP lines per database (dry-run)")
 		verbose      = flag.Bool("verbose", false, "verbose per-shard/chunk logging")
 		pipeline     = flag.Bool("pipeline", true, "overlap extraction with upload (one extra chunk buffer per worker); =false reverts to serial send")
+		analyze      = flag.Bool("analyze", false, "index-only shard analysis (no data decoded, nothing sent): series/file/key counts and window-split profiles per shard")
 		inclInternal = flag.Bool("include-internal", false, "include InfluxDB 1.x's _internal database (2.x system buckets are always skipped)")
 		showVersion  = flag.Bool("version", false, "print version and exit")
 		onInvalid    = flag.String("on-invalid-measurement", "fail", "what to do with a measurement name Arc would reject (after --measurement-map): fail|skip|map (map = deterministic auto-rename, recorded in the checkpoint)")
@@ -124,6 +125,8 @@ func main() {
 	// DefaultMaxBytes (450 MiB).
 	chunkBytes := byteSize(chunk.DefaultMaxBytes)
 	flag.Var(&chunkBytes, "chunk-bytes", "max raw LP per import request, bytes or suffixed e.g. 450MB (must be < 500MB)")
+	indexCacheSize := byteSize(2 << 30)
+	flag.Var(&indexCacheSize, "index-cache", "per-shard memory budget for cached TSM file indexes, bytes or suffixed e.g. 2GB (0 disables; avoids re-parsing indexes on every per-series reopen)")
 	flag.Var(&dbFilterArg, "database-filter", "only migrate this source database/bucket (repeatable)")
 	flag.Var(&dbMapArg, "db-map", "rename source DB/bucket to Arc DB, form old=new (repeatable)")
 	flag.Var(&mMapArg, "measurement-map", "rename a source measurement, form old=new; new must satisfy Arc's name rule (repeatable)")
@@ -137,12 +140,12 @@ func main() {
 	if *datadir == "" {
 		fatal("--datadir is required")
 	}
-	if !*dryRun {
+	if !*dryRun && !*analyze {
 		if *arcURL == "" {
-			fatal("--arc-url is required (or use --dry-run)")
+			fatal("--arc-url is required (or use --dry-run / --analyze)")
 		}
 		if *token == "" {
-			fatal("--token (or ARC_TOKEN) is required (or use --dry-run)")
+			fatal("--token (or ARC_TOKEN) is required (or use --dry-run / --analyze)")
 		}
 	}
 	if int(chunkBytes) >= 500*1024*1024 {
@@ -289,17 +292,22 @@ func main() {
 
 	ctx := context.Background()
 	cfg := runConfig{
-		shards:    shards,
-		start:     start,
-		end:       end,
-		chunkSize: int(chunkBytes),
-		dbMap:     dbMap,
-		resolver:  resolver,
-		verbose:   *verbose,
-		workers:   *workers,
-		pipeline:  *pipeline,
+		shards:     shards,
+		start:      start,
+		end:        end,
+		chunkSize:  int(chunkBytes),
+		dbMap:      dbMap,
+		resolver:   resolver,
+		verbose:    *verbose,
+		workers:    *workers,
+		pipeline:   *pipeline,
+		indexCache: int64(indexCacheSize),
 	}
 
+	if *analyze {
+		runAnalyze(cfg)
+		return
+	}
 	if *dryRun {
 		runDryRun(ctx, cfg, *sampleN)
 		return
@@ -346,15 +354,16 @@ func configFingerprint(cfg runConfig, precision string) string {
 
 // runConfig is the shared input for both dry-run and load.
 type runConfig struct {
-	shards    []discover.Shard
-	start     int64
-	end       int64
-	chunkSize int
-	dbMap     map[string]string
-	resolver  *measure.Resolver // nil (tests) = pass-through, no validation
-	verbose   bool
-	workers   int
-	pipeline  bool // overlap extraction with send (see loadShard)
+	shards     []discover.Shard
+	start      int64
+	end        int64
+	chunkSize  int
+	dbMap      map[string]string
+	resolver   *measure.Resolver // nil (tests) = pass-through, no validation
+	verbose    bool
+	workers    int
+	pipeline   bool  // overlap extraction with send (see loadShard)
+	indexCache int64 // per-shard budget for cached TSM indexes (0 = disabled)
 }
 
 func (c runConfig) arcDB(sourceDB string) string {

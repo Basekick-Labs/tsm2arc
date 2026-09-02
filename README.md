@@ -121,6 +121,13 @@ natural root and it resolves the rest:
 #   --pipeline               overlap extraction with upload (default true; =false
 #                            reverts to serial send and saves one chunk buffer
 #                            of memory per worker)
+#   --index-cache SIZE       per-shard budget for cached TSM file indexes
+#                            (default 2GB; 0 disables). Avoids re-parsing every
+#                            file's index once per series during extraction —
+#                            a large CPU cost on shards with many series.
+#   --analyze                index-only shard profile (fast; nothing decoded or
+#                            sent): series/file/key counts per shard and window-
+#                            split profiles for the largest merge runs
 #   --dry-run                extract + count, do not write to Arc
 #   --sample N               print N sample LP lines per DB in --dry-run (default 5)
 #   --verbose                per-shard / per-chunk logging

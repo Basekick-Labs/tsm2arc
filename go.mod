@@ -23,6 +23,8 @@ require (
 	github.com/influxdata/roaring v0.4.13-0.20180809181101-fc520f41fab6 // indirect
 	github.com/jsternberg/zap-logfmt v1.2.0 // indirect
 	github.com/jwilder/encoding v0.0.0-20170811194829-b4e1701a28ef // indirect
+	github.com/klauspost/compress v1.15.9 // indirect
+	github.com/klauspost/pgzip v1.2.6 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mschoch/smat v0.0.0-20160514031455-90eadee771ae // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect

@@ -5,15 +5,36 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"time"
 )
+
+// Index is one TSM file's parsed block index, decoupled from the file handle so
+// it can be parsed ONCE and reused across many re-opens of the same file — a
+// shard extraction re-opens each file once per (series, run), and re-parsing
+// the ENTIRE index every time (all series' keys, not just the one being read)
+// was measured as a series×files CPU cost on wide shards.
+//
+// IMMUTABILITY CONTRACT: an Index is never written after parse. Accessors must
+// keep it that way — Keys() returns a fresh slice precisely so callers can sort
+// their copy without corrupting a cached Index shared across readers (and, in
+// the future, across concurrent extraction tasks). Do not "optimize" an
+// accessor into returning internal state that a caller might mutate.
+type Index struct {
+	keys    []keyBlocks // sorted by key, file order within a key
+	size    int64       // file size the index was parsed from
+	modTime time.Time   // file mtime at parse — staleness guard together with size
+	approx  int64       // estimated in-memory footprint (see parseIndex)
+}
+
+// ApproxBytes estimates the Index's resident memory, for cache budgeting.
+func (ix *Index) ApproxBytes() int64 { return ix.approx }
 
 // Reader reads a single TSM file. Open parses the index; ReadAll decodes every
 // block into per-key value slices. For TB-scale migration we read one shard at a
 // time but a whole file's index fits comfortably in memory.
 type Reader struct {
-	f    *os.File
-	size int64
-	keys []keyBlocks // sorted by key, file order within a key
+	f  *os.File
+	ix *Index
 }
 
 // Open opens a TSM file and parses its index. The file is kept open for block
@@ -28,56 +49,88 @@ func Open(path string) (*Reader, error) {
 		f.Close()
 		return nil, err
 	}
-	r := &Reader{f: f, size: st.Size()}
-	if err := r.readIndex(); err != nil {
+	ix, err := parseIndex(f, st.Size(), st.ModTime())
+	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	return r, nil
+	return &Reader{f: f, ix: ix}, nil
 }
+
+// OpenWithIndex opens a TSM file reusing a previously parsed Index, skipping
+// the parse entirely. The file must be the same one the Index came from: size
+// and mtime are verified, and a mismatch fails loudly — extraction order (and
+// therefore resume) is only meaningful against unchanged source data.
+func OpenWithIndex(path string, ix *Index) (*Reader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if st.Size() != ix.size || !st.ModTime().Equal(ix.modTime) {
+		f.Close()
+		return nil, fmt.Errorf("tsm: %s changed since its index was parsed (size %d→%d, mtime %s→%s): source data must not change during a migration",
+			path, ix.size, st.Size(), ix.modTime.Format(time.RFC3339Nano), st.ModTime().Format(time.RFC3339Nano))
+	}
+	return &Reader{f: f, ix: ix}, nil
+}
+
+// Index returns the file's parsed index for reuse via OpenWithIndex. The Index
+// is immutable and remains valid after Close.
+func (r *Reader) Index() *Index { return r.ix }
 
 func (r *Reader) Close() error { return r.f.Close() }
 
-// Keys returns the series+field keys present in the file, sorted.
+// Keys returns the series+field keys present in the file, sorted. The slice is
+// freshly allocated on every call — callers may reorder it freely (and do; see
+// the Index immutability contract).
 func (r *Reader) Keys() []string {
-	out := make([]string, len(r.keys))
-	for i, k := range r.keys {
+	out := make([]string, len(r.ix.keys))
+	for i, k := range r.ix.keys {
 		out[i] = k.Key
 	}
 	return out
 }
 
-func (r *Reader) readIndex() error {
-	if r.size < headerSize+footerSize {
-		return errBadBlock
+// parseIndex reads and parses a TSM file's index region into an immutable
+// Index.
+func parseIndex(f *os.File, size int64, modTime time.Time) (*Index, error) {
+	if size < headerSize+footerSize {
+		return nil, errBadBlock
 	}
 	// header
 	hdr := make([]byte, headerSize)
-	if _, err := r.f.ReadAt(hdr, 0); err != nil {
-		return err
+	if _, err := f.ReadAt(hdr, 0); err != nil {
+		return nil, err
 	}
 	if binary.BigEndian.Uint32(hdr[:4]) != magic {
-		return errBadMagic
+		return nil, errBadMagic
 	}
 	if hdr[4] != version {
-		return fmt.Errorf("%w: got 0x%02x", errBadVersion, hdr[4])
+		return nil, fmt.Errorf("%w: got 0x%02x", errBadVersion, hdr[4])
 	}
 	// footer = index offset
 	foot := make([]byte, footerSize)
-	if _, err := r.f.ReadAt(foot, r.size-footerSize); err != nil {
-		return err
+	if _, err := f.ReadAt(foot, size-footerSize); err != nil {
+		return nil, err
 	}
 	indexOffset := int64(binary.BigEndian.Uint64(foot))
-	if indexOffset < headerSize || indexOffset > r.size-footerSize {
-		return fmt.Errorf("%w: bad index offset %d", errBadBlock, indexOffset)
+	if indexOffset < headerSize || indexOffset > size-footerSize {
+		return nil, fmt.Errorf("%w: bad index offset %d", errBadBlock, indexOffset)
 	}
 
 	// read the whole index region
-	indexLen := r.size - footerSize - indexOffset
+	indexLen := size - footerSize - indexOffset
 	idx := make([]byte, indexLen)
-	if _, err := r.f.ReadAt(idx, indexOffset); err != nil {
-		return err
+	if _, err := f.ReadAt(idx, indexOffset); err != nil {
+		return nil, err
 	}
+
+	ix := &Index{size: size, modTime: modTime}
 
 	// parse index entries:
 	//   keyLen(2) key(keyLen) type(1) count(2)
@@ -85,12 +138,12 @@ func (r *Reader) readIndex() error {
 	p := 0
 	for p < len(idx) {
 		if p+2 > len(idx) {
-			return errBadBlock
+			return nil, errBadBlock
 		}
 		keyLen := int(binary.BigEndian.Uint16(idx[p:]))
 		p += 2
 		if p+keyLen+3 > len(idx) {
-			return errBadBlock
+			return nil, errBadBlock
 		}
 		key := string(idx[p : p+keyLen])
 		p += keyLen
@@ -102,7 +155,7 @@ func (r *Reader) readIndex() error {
 		kb := keyBlocks{Key: key, Type: typ, Entries: make([]IndexEntry, 0, count)}
 		for i := 0; i < count; i++ {
 			if p+indexEntrySize > len(idx) {
-				return errBadBlock
+				return nil, errBadBlock
 			}
 			e := IndexEntry{
 				MinTime: int64(binary.BigEndian.Uint64(idx[p:])),
@@ -113,11 +166,16 @@ func (r *Reader) readIndex() error {
 			p += indexEntrySize
 			kb.Entries = append(kb.Entries, e)
 		}
-		r.keys = append(r.keys, kb)
+		ix.keys = append(ix.keys, kb)
 	}
 
-	sort.Slice(r.keys, func(i, j int) bool { return r.keys[i].Key < r.keys[j].Key })
-	return nil
+	sort.Slice(ix.keys, func(i, j int) bool { return ix.keys[i].Key < ix.keys[j].Key })
+
+	// Footprint estimate for cache budgeting: the parsed form is roughly the
+	// on-disk index (key bytes + 28B/entry, already counted by indexLen) with
+	// slightly wider entries, plus per-key struct/slice/string overhead.
+	ix.approx = indexLen*2 + int64(len(ix.keys))*96
+	return ix, nil
 }
 
 // ReadKey decodes all blocks for one key into a flat, time-ordered slice of
@@ -146,9 +204,9 @@ func (r *Reader) readEntry(typ byte, key string, e IndexEntry) ([]Value, error) 
 	// Bound the declared block size against the file before allocating: a
 	// corrupt/crafted index entry can claim up to 4 GB (uint32), which would
 	// otherwise allocate before ReadAt fails. Offset+Size must fit in the file.
-	if e.Offset < 0 || e.Offset+int64(e.Size) > r.size {
+	if e.Offset < 0 || e.Offset+int64(e.Size) > r.ix.size {
 		return nil, fmt.Errorf("%w: block at off=%d size=%d exceeds file size %d",
-			errBadBlock, e.Offset, e.Size, r.size)
+			errBadBlock, e.Offset, e.Size, r.ix.size)
 	}
 	buf := make([]byte, e.Size)
 	if _, err := r.f.ReadAt(buf, e.Offset); err != nil {
@@ -161,10 +219,10 @@ func (r *Reader) readEntry(typ byte, key string, e IndexEntry) ([]Value, error) 
 	return vals, nil
 }
 
-// search returns the index of key in r.keys, or -1 if absent.
+// search returns the index of key in r.ix.keys, or -1 if absent.
 func (r *Reader) search(key string) int {
-	i := sort.Search(len(r.keys), func(i int) bool { return r.keys[i].Key >= key })
-	if i >= len(r.keys) || r.keys[i].Key != key {
+	i := sort.Search(len(r.ix.keys), func(i int) bool { return r.ix.keys[i].Key >= key })
+	if i >= len(r.ix.keys) || r.ix.keys[i].Key != key {
 		return -1
 	}
 	return i
@@ -179,7 +237,7 @@ func (r *Reader) Blocks(key string) []IndexEntry {
 	if i < 0 {
 		return nil
 	}
-	return r.keys[i].Entries
+	return r.ix.keys[i].Entries
 }
 
 // ReadBlockAt decodes one block of key, identified by an entry from Blocks.
@@ -190,7 +248,7 @@ func (r *Reader) ReadBlockAt(key string, e IndexEntry) ([]Value, error) {
 	if i < 0 {
 		return nil, nil
 	}
-	return r.readEntry(r.keys[i].Type, key, e)
+	return r.readEntry(r.ix.keys[i].Type, key, e)
 }
 
 // ReadKeyByName decodes all blocks for the named key. Returns nil if the key is
@@ -200,7 +258,7 @@ func (r *Reader) ReadKeyByName(key string) ([]Value, error) {
 	if i < 0 {
 		return nil, nil
 	}
-	return r.ReadKey(r.keys[i])
+	return r.ReadKey(r.ix.keys[i])
 }
 
 // decodeBlock splits a raw block (crc32 prefix already included) into its

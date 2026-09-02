@@ -56,6 +56,12 @@ func (p *progress) logf(format string, args ...any) {
 	if !p.verbose {
 		return
 	}
+	p.notef(format, args...)
+}
+
+// notef prints a line under the stdout lock regardless of verbosity — for
+// operator-actionable notices (e.g. a budget limiting the index cache).
+func (p *progress) notef(format string, args ...any) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	fmt.Printf("  "+format+"\n", args...)
