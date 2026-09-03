@@ -114,6 +114,7 @@ func main() {
 		verbose      = flag.Bool("verbose", false, "verbose per-shard/chunk logging")
 		pipeline     = flag.Bool("pipeline", true, "overlap extraction with upload (one extra chunk buffer per worker); =false reverts to serial send")
 		analyze      = flag.Bool("analyze", false, "index-only shard analysis (no data decoded, nothing sent): series/file/key counts and window-split profiles per shard")
+		redact       = flag.Bool("redact", false, "with --analyze: replace database, retention policy, and series names with stable hashed identifiers so the report can be shared without exposing internal names")
 		shardSplit   = flag.Int("shard-split", 1, "max concurrent merge tasks per shard (intra-shard parallelism; output is byte-identical to 1). Requires --merge-memory when > 1")
 		inclInternal = flag.Bool("include-internal", false, "include InfluxDB 1.x's _internal database (2.x system buckets are always skipped)")
 		showVersion  = flag.Bool("version", false, "print version and exit")
@@ -163,6 +164,9 @@ func main() {
 	}
 	if *shardSplit < 1 {
 		fatal("--shard-split must be >= 1")
+	}
+	if *redact && !*analyze {
+		fatal("--redact applies to --analyze output; add --analyze (load and --dry-run output are not meant to leave your organization)")
 	}
 	if *shardSplit > 1 && mergeMemory <= 0 {
 		fatal("--merge-memory is required with --shard-split > 1: concurrent merges are bounded by memory, not worker count.\n" +
@@ -315,6 +319,7 @@ func main() {
 		pipeline:   *pipeline,
 		indexCache: int64(indexCacheSize),
 		split:      extract.SplitOptions{Workers: *shardSplit, MemoryBudget: int64(mergeMemory)},
+		redact:     *redact,
 	}
 
 	if *analyze {
@@ -378,6 +383,7 @@ type runConfig struct {
 	pipeline   bool  // overlap extraction with send (see loadShard)
 	indexCache int64 // per-shard budget for cached TSM indexes (0 = disabled)
 	split      extract.SplitOptions
+	redact     bool // --analyze only: pseudonymize identifiers in the report
 }
 
 func (c runConfig) arcDB(sourceDB string) string {

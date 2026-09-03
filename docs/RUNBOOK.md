@@ -135,6 +135,12 @@ can help your data shape.
 tsm2arc --datadir /mnt/influx/data --analyze
 ```
 
+If the report must leave your organization (support tickets, issues), add
+`--redact`: database, retention policy, and series names are replaced with
+stable hashed pseudonyms (`series_3f9a2c1b04d7`), so the report carries every
+number but no internal identifiers. The pseudonyms are stable across runs and
+machines, so a conversation can keep referring to the same series.
+
 ---
 
 ## 3. Scope the migration (optional)

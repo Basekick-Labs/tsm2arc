@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"time"
@@ -26,8 +28,12 @@ func runAnalyze(cfg runConfig) {
 			if err != nil {
 				fatal("analyze %s/%s: %v", sh.Database, sh.ShardID, err)
 			}
+			db, rp := sh.Database, sh.Retention
+			if cfg.redact {
+				db, rp = redactName("db", db), redactName("rp", rp)
+			}
 			fmt.Printf("\nshard %s/%s/%s: %d series, %d tsm files, %d keys",
-				sh.Database, sh.Retention, sh.ShardID, an.Series, an.Files, an.Keys)
+				db, rp, sh.ShardID, an.Series, an.Files, an.Keys)
 			if an.SkippedKey > 0 {
 				fmt.Printf(", %d skipped keys", an.SkippedKey)
 			}
@@ -40,7 +46,11 @@ func runAnalyze(cfg runConfig) {
 				runs = runs[:5]
 			}
 			for _, r := range runs {
-				fmt.Printf("  run: series=%s\n", truncate(r.SeriesKey, 80))
+				name := truncate(r.SeriesKey, 80)
+				if cfg.redact {
+					name = redactName("series", r.SeriesKey)
+				}
+				fmt.Printf("  run: series=%s\n", name)
 				fmt.Printf("       %d files, %d streams, %d blocks, %s, %s .. %s\n",
 					r.Files, r.Streams, r.Blocks, fmtBytes(r.Bytes),
 					fmtDay(r.MinTime), fmtDay(r.MaxTime))
@@ -64,6 +74,21 @@ func runAnalyze(cfg runConfig) {
 		}
 	}
 	fmt.Println("\nShare this output when discussing throughput: it determines whether intra-shard splitting can help your data shape.")
+	if !cfg.redact {
+		fmt.Println("If the report must leave your organization, re-run with --redact: it replaces database, retention policy, and series names with stable hashed identifiers while keeping every number.")
+	}
+}
+
+// redactName replaces an internal identifier with a stable pseudonym: a fixed
+// prefix plus the first 12 hex chars of the name's SHA-256. Stability is the
+// point — the same source produces the same pseudonyms on every run and every
+// machine, so a support conversation can keep referring to series_3f9a2c1b04d7
+// across re-runs. The hash is deliberately unsalted for that stability; note
+// that a short, guessable name could in principle be confirmed by hashing
+// guesses, so --redact protects identifiers, not secrets embedded in them.
+func redactName(prefix, name string) string {
+	sum := sha256.Sum256([]byte(name))
+	return prefix + "_" + hex.EncodeToString(sum[:])[:12]
 }
 
 func windowStats(ws []int) (min, med, max int) {
