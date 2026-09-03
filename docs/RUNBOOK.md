@@ -412,10 +412,12 @@ tsm2arc --datadir <same> [--waldir <same>] [--start <same> --end <same>] --dry-r
 
 # Arc side — count rows per measurement. If you migrated with --start/--end,
 # add the SAME time bounds to the query so both sides cover the same window.
-curl -s -H "Authorization: Bearer $ARC_TOKEN" \
-  "https://arc.example.net/api/v1/query" \
-  --data-urlencode "q=SELECT count(*) FROM <measurement> WHERE time >= '<start>' AND time <= '<end>'" \
-  --data-urlencode 'db=<database>'
+# Arc's /api/v1/query takes a POST with a JSON body ({"sql": ...}); reference the
+# database as <database>.<measurement> in the SQL (or send an x-arc-database header).
+curl -s -X POST "https://arc.example.net/api/v1/query" \
+  -H "Authorization: Bearer $ARC_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"sql\": \"SELECT count(*) FROM <database>.<measurement> WHERE time >= '<start>' AND time <= '<end>'\"}"
 ```
 
 - **Tag-bearing** data: after Arc compaction runs, counts should match exactly.
