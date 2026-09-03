@@ -135,6 +135,9 @@ natural root and it resolves the rest:
 #   --analyze                index-only shard profile (fast; nothing decoded or
 #                            sent): series/file/key counts per shard and window-
 #                            split profiles for the largest merge runs
+#   --redact                 with --analyze: replace database, retention policy,
+#                            and series names with stable hashed identifiers so
+#                            the report can be shared outside your organization
 #   --dry-run                extract + count, do not write to Arc
 #   --sample N               print N sample LP lines per DB in --dry-run (default 5)
 #   --verbose                per-shard / per-chunk logging
