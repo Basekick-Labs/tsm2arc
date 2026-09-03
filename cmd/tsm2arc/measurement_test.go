@@ -18,6 +18,7 @@ import (
 
 	"github.com/basekick-labs/tsm2arc/internal/checkpoint"
 	"github.com/basekick-labs/tsm2arc/internal/discover"
+	"github.com/basekick-labs/tsm2arc/internal/extract"
 	"github.com/basekick-labs/tsm2arc/internal/measure"
 	"github.com/basekick-labs/tsm2arc/internal/sink"
 	itsm "github.com/influxdata/influxdb/tsdb/engine/tsm1"
@@ -352,6 +353,41 @@ func TestSkipAuditExactAcrossSeekResume(t *testing.T) {
 	for _, r := range rows {
 		if r.Action != "skipped" || r.Points != 3 {
 			t.Errorf("audit not exact across seek resume: %+v (want skipped/3)", r)
+		}
+	}
+}
+
+// TestSkipAuditIdenticalUnderShardSplit: the measurement audit (skip/rename
+// counts) must come out identical with intra-shard parallelism — the tally is
+// driven by the consumer-side emission order, which the split preserves.
+func TestSkipAuditIdenticalUnderShardSplit(t *testing.T) {
+	resolver, _ := measure.NewResolver(nil, measure.PolicySkip)
+	cfg, arc, srv, cpPath := newMeasurementTestEnv(t, resolver)
+	cfg.chunkSize = 64 // one line per chunk — boundaries everywhere
+	cfg.split = extract.SplitOptions{Workers: 3, MemoryBudget: 64 << 20}
+	cp, _ := checkpoint.Open(cpPath)
+	defer cp.Close()
+
+	res, err := load(context.Background(), cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Rows != 6 || res.SkippedPoints != 6 {
+		t.Errorf("rows=%d skipped=%d, want 6/6", res.Rows, res.SkippedPoints)
+	}
+	if arc.rejects != 0 {
+		t.Errorf("Arc rejected %d requests under split", arc.rejects)
+	}
+	rows, err := cp.MeasurementReport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("report rows = %d, want 2: %+v", len(rows), rows)
+	}
+	for _, r := range rows {
+		if r.Action != "skipped" || r.Points != 3 {
+			t.Errorf("audit under split: %+v, want skipped/3", r)
 		}
 	}
 }

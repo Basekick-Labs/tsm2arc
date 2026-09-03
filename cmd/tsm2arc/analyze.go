@@ -47,6 +47,10 @@ func runAnalyze(cfg runConfig) {
 				min, med, max := windowStats(r.WindowStreams)
 				fmt.Printf("       %d-way window profile: streams/window min=%d median=%d max=%d (of %d total)\n",
 					len(r.WindowStreams), min, med, max, r.Streams)
+				if r.Bytes < 256<<20 {
+					fmt.Printf("       verdict: below the split threshold — this run would never be windowed\n")
+					continue
+				}
 				// Verdict: if the busiest window still touches most streams, a
 				// window split cannot shrink the resident decoded-block set.
 				if r.Streams > 0 && max*10 >= r.Streams*8 {

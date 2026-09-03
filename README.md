@@ -121,6 +121,13 @@ natural root and it resolves the rest:
 #   --pipeline               overlap extraction with upload (default true; =false
 #                            reverts to serial send and saves one chunk buffer
 #                            of memory per worker)
+#   --shard-split N          max concurrent merge tasks per shard (default 1).
+#                            Output is byte-identical to serial, so resume works
+#                            across different values. Requires --merge-memory
+#   --merge-memory SIZE      per-shard admission budget for concurrent merges
+#                            (e.g. 24GB). Concurrent merges are bounded by
+#                            memory, not cores: a merge holds ~one decoded block
+#                            per (file x field) stream. Oversized tasks run alone
 #   --index-cache SIZE       per-shard budget for cached TSM file indexes
 #                            (default 2GB; 0 disables). Avoids re-parsing every
 #                            file's index once per series during extraction —

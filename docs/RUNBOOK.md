@@ -254,6 +254,26 @@ Guidance:
 You can also lower `--chunk-bytes` to reduce per-request memory (e.g.
 `--chunk-bytes 200MB`), at the cost of more requests.
 
+### Intra-shard parallelism (`--shard-split`)
+
+When a few large shards dominate wall-clock and cores sit idle, `--shard-split N`
+merges up to N windows of a shard concurrently while emitting byte-identical
+output — resume, checkpoints, and audit are unaffected, and N may change
+between a crash and its resume.
+
+Run `--analyze` first: it profiles whether your shards' file time ranges
+partition into windows (SPLIT-FRIENDLY) or overlap fully (OVERLAPPING). On
+fully overlapping generations every window still holds the whole run's decoded
+blocks, and the admission budget will serialize the tasks — the flag then buys
+little.
+
+`--merge-memory` is required with `--shard-split > 1`: a concurrent merge holds
+roughly one decoded block (~64 KiB) per (file × field) stream, so wide shards
+cost GiBs per concurrent task. Size it against free RAM:
+`(host RAM − workers × 2 × chunk-bytes − index caches) / workers`, then set
+`--shard-split` to 2–4. A task whose estimate exceeds the budget runs alone
+(the serial memory profile) — never an error, just no extra parallelism.
+
 ### Migration-host memory
 
 Separately from the Arc node, watch the **migration host's** own RAM:

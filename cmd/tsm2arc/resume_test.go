@@ -18,6 +18,7 @@ import (
 
 	"github.com/basekick-labs/tsm2arc/internal/checkpoint"
 	"github.com/basekick-labs/tsm2arc/internal/discover"
+	"github.com/basekick-labs/tsm2arc/internal/extract"
 	"github.com/basekick-labs/tsm2arc/internal/sink"
 	itsm "github.com/influxdata/influxdb/tsdb/engine/tsm1"
 )
@@ -318,6 +319,59 @@ func TestFinalChunkFailureBlocksDoneMark(t *testing.T) {
 	cp2.Close()
 	if lines := arc.distinctLines(); len(lines) != nSeries {
 		t.Fatalf("distinct points = %d, want %d", len(lines), nSeries)
+	}
+}
+
+// TestResumeAcrossShardSplitChange: --shard-split is a pure performance knob —
+// output is byte-identical at any value — so a crash under one worker count
+// must resume cleanly under another, in BOTH directions, delivering exactly
+// what an uninterrupted serial run delivers.
+func TestResumeAcrossShardSplitChange(t *testing.T) {
+	const nSeries = 60
+	datadir := writeTSMShard(t, "metrics", nSeries)
+	shards, _ := discover.Walk(datadir, "", nil, false)
+	serialCfg := runConfig{shards: shards, start: math.MinInt64, end: math.MaxInt64, chunkSize: 256, pipeline: true}
+	splitCfg := serialCfg
+	splitCfg.split = extract.SplitOptions{Workers: 3, MemoryBudget: 64 << 20}
+	ctx := context.Background()
+
+	// Reference: uninterrupted serial run.
+	ref := &crashingArc{crashAfter: -1}
+	refSrv := httptest.NewServer(http.HandlerFunc(ref.handler))
+	defer refSrv.Close()
+	cpRef, _ := checkpoint.Open(filepath.Join(t.TempDir(), "ref.db"))
+	if _, err := load(ctx, serialCfg, sink.New(refSrv.URL, "tok", "ns", fastRetry()), cpRef); err != nil {
+		t.Fatal(err)
+	}
+	cpRef.Close()
+
+	for name, cfgs := range map[string][2]runConfig{
+		"crash-split-resume-serial": {splitCfg, serialCfg},
+		"crash-serial-resume-split": {serialCfg, splitCfg},
+	} {
+		arc := &crashingArc{crashAfter: 3}
+		srv := httptest.NewServer(http.HandlerFunc(arc.handler))
+		cpPath := filepath.Join(t.TempDir(), "cp.db")
+		cp1, _ := checkpoint.Open(cpPath)
+		if _, err := load(ctx, cfgs[0], sink.New(srv.URL, "tok", "ns", fastRetry()), cp1); err == nil {
+			t.Fatalf("%s: expected crash", name)
+		}
+		cp1.Close()
+		arc.crashAfter = -1
+		cp2, _ := checkpoint.Open(cpPath)
+		if _, err := load(ctx, cfgs[1], sink.New(srv.URL, "tok", "ns", fastRetry()), cp2); err != nil {
+			t.Fatalf("%s: resume failed: %v", name, err)
+		}
+		cp2.Close()
+		if len(arc.acceptedLP) != len(ref.acceptedLP) {
+			t.Fatalf("%s: delivered %d chunks, reference %d", name, len(arc.acceptedLP), len(ref.acceptedLP))
+		}
+		for i := range ref.acceptedLP {
+			if !bytes.Equal(arc.acceptedLP[i], ref.acceptedLP[i]) {
+				t.Fatalf("%s: chunk %d differs from serial reference", name, i)
+			}
+		}
+		srv.Close()
 	}
 }
 

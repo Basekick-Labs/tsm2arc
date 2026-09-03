@@ -20,7 +20,13 @@ INFLUX_URL="${INFLUX_URL:-http://localhost:8086}"
 
 write() {  # write <db> <line-protocol...>
   local db="$1"; shift
-  curl -sS -XPOST "${INFLUX_URL}/write?db=${db}&precision=ns" --data-binary "$*"
+  local out
+  out=$(curl -sS -XPOST "${INFLUX_URL}/write?db=${db}&precision=ns" --data-binary "$*")
+  if [ -n "$out" ]; then
+    echo "WRITE FAILED: $out" >&2
+    echo "  line: $*" >&2
+    exit 1
+  fi
 }
 
 q() { curl -sS -XPOST "${INFLUX_URL}/query" --data-urlencode "q=$1" >/dev/null; }
@@ -41,10 +47,13 @@ write telemetry 'cpu,host=node-a,region=us-west usage_idle=98.5,cores=8i 1700000
 write telemetry 'cpu,host=node-a,region=us-west usage_idle=97.2,cores=8i 1700000001000000000'
 write telemetry 'cpu,host=node-b,region=eu-central usage_idle=51.0,cores=16i 1700000000000000000'
 
-echo "==> telemetry: boolean + string + unsigned fields"
-# status: boolean field; note: string field; count: unsigned integer field (1.8 supports 'u' suffix)
-write telemetry 'status,host=node-a healthy=true,note="all systems nominal",reboots=3u 1700000000000000000'
-write telemetry 'status,host=node-b healthy=false,note="degraded link",reboots=12u 1700000000000000000'
+echo "==> telemetry: boolean + string fields"
+# status: boolean field; note: string field. NOTE: no unsigned ('u' suffix)
+# fields here — stock InfluxDB 1.8 rejects them (uint64 support is opt-in at
+# build time), and the write failure used to be silent. The unsigned codec is
+# covered by internal/tsm unit tests against the real InfluxDB encoder.
+write telemetry 'status,host=node-a healthy=true,note="all systems nominal",reboots=3i 1700000000000000000'
+write telemetry 'status,host=node-b healthy=false,note="degraded link",reboots=12i 1700000000000000000'
 
 echo "==> telemetry: PRE-EPOCH point (1959-12-16T00:00:00Z = -317001600 s)"
 # -317001600 s * 1e9 = -317001600000000000 ns (1959, before the Unix epoch).

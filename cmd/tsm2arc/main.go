@@ -22,6 +22,7 @@ import (
 	"github.com/basekick-labs/tsm2arc/internal/checkpoint"
 	"github.com/basekick-labs/tsm2arc/internal/chunk"
 	"github.com/basekick-labs/tsm2arc/internal/discover"
+	"github.com/basekick-labs/tsm2arc/internal/extract"
 	"github.com/basekick-labs/tsm2arc/internal/measure"
 	"github.com/basekick-labs/tsm2arc/internal/sink"
 )
@@ -113,6 +114,7 @@ func main() {
 		verbose      = flag.Bool("verbose", false, "verbose per-shard/chunk logging")
 		pipeline     = flag.Bool("pipeline", true, "overlap extraction with upload (one extra chunk buffer per worker); =false reverts to serial send")
 		analyze      = flag.Bool("analyze", false, "index-only shard analysis (no data decoded, nothing sent): series/file/key counts and window-split profiles per shard")
+		shardSplit   = flag.Int("shard-split", 1, "max concurrent merge tasks per shard (intra-shard parallelism; output is byte-identical to 1). Requires --merge-memory when > 1")
 		inclInternal = flag.Bool("include-internal", false, "include InfluxDB 1.x's _internal database (2.x system buckets are always skipped)")
 		showVersion  = flag.Bool("version", false, "print version and exit")
 		onInvalid    = flag.String("on-invalid-measurement", "fail", "what to do with a measurement name Arc would reject (after --measurement-map): fail|skip|map (map = deterministic auto-rename, recorded in the checkpoint)")
@@ -127,6 +129,8 @@ func main() {
 	flag.Var(&chunkBytes, "chunk-bytes", "max raw LP per import request, bytes or suffixed e.g. 450MB (must be < 500MB)")
 	indexCacheSize := byteSize(2 << 30)
 	flag.Var(&indexCacheSize, "index-cache", "per-shard memory budget for cached TSM file indexes, bytes or suffixed e.g. 2GB (0 disables; avoids re-parsing indexes on every per-series reopen)")
+	mergeMemory := byteSize(0)
+	flag.Var(&mergeMemory, "merge-memory", "per-shard admission budget for concurrent merge tasks with --shard-split > 1 (bytes or suffixed, e.g. 24GB). No default: size it against free RAM / workers; a task exceeding it runs alone")
 	flag.Var(&dbFilterArg, "database-filter", "only migrate this source database/bucket (repeatable)")
 	flag.Var(&dbMapArg, "db-map", "rename source DB/bucket to Arc DB, form old=new (repeatable)")
 	flag.Var(&mMapArg, "measurement-map", "rename a source measurement, form old=new; new must satisfy Arc's name rule (repeatable)")
@@ -156,6 +160,14 @@ func main() {
 	}
 	if *workers < 1 {
 		fatal("--workers must be >= 1")
+	}
+	if *shardSplit < 1 {
+		fatal("--shard-split must be >= 1")
+	}
+	if *shardSplit > 1 && mergeMemory <= 0 {
+		fatal("--merge-memory is required with --shard-split > 1: concurrent merges are bounded by memory, not worker count.\n" +
+			"  Size it against the migration host: roughly (free RAM - workers×2×chunk-bytes - index caches) / workers.\n" +
+			"  A task whose estimated footprint exceeds the budget runs alone (serial memory profile).")
 	}
 
 	start, end := int64(math.MinInt64), int64(math.MaxInt64)
@@ -302,6 +314,7 @@ func main() {
 		workers:    *workers,
 		pipeline:   *pipeline,
 		indexCache: int64(indexCacheSize),
+		split:      extract.SplitOptions{Workers: *shardSplit, MemoryBudget: int64(mergeMemory)},
 	}
 
 	if *analyze {
@@ -364,6 +377,7 @@ type runConfig struct {
 	workers    int
 	pipeline   bool  // overlap extraction with send (see loadShard)
 	indexCache int64 // per-shard budget for cached TSM indexes (0 = disabled)
+	split      extract.SplitOptions
 }
 
 func (c runConfig) arcDB(sourceDB string) string {
