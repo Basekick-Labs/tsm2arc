@@ -334,24 +334,33 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 	}
 
 	var snd *sender
-	snd = newSender(ctx, cfg.pipeline, func(ctx context.Context, j sendJob) error {
-		sres, err := snk.Send(ctx, arcDB, j.lp)
-		if err != nil {
-			return fmt.Errorf("send %s/%s chunk %d to %q: %w", label, sh.ShardID, j.seq, arcDB, err)
-		}
-		// Commit AFTER 2xx — the durability barrier for resume. Cursor and audit
-		// deltas ride the same transaction, so they can never disagree with seq.
-		if err := cp.Commit(cpKey, sh.ShardID, j.seq, sres.Result.RowsImported, j.cur, j.deltas); err != nil {
-			return fmt.Errorf("checkpoint commit %s/%s chunk %d: %w", label, sh.ShardID, j.seq, err)
-		}
-		snd.sent++
-		snd.rows += sres.Result.RowsImported
-		prog.noteActivity(actKey)
-		prog.addChunk(int64(len(j.lp)), sres.Result.RowsImported)
-		prog.logf("[%s/%s] chunk %d: %d bytes raw → %d rows", label, sh.ShardID, j.seq, len(j.lp), sres.Result.RowsImported)
-		return nil
+	snd = newSender(ctx, senderConfig{
+		pipelined: cfg.pipeline,
+		inflight:  cfg.inflight,
+		firstSeq:  committed + 1,
+		post: func(ctx context.Context, j sendJob) (sink.Result, error) {
+			sres, err := snk.Send(ctx, arcDB, j.lp)
+			if err != nil {
+				return sres, fmt.Errorf("send %s/%s chunk %d to %q: %w", label, sh.ShardID, j.seq, arcDB, err)
+			}
+			return sres, nil
+		},
+		// commit runs on the single committer goroutine, strictly in seq order —
+		// the durability barrier for resume. Cursor and audit deltas ride the
+		// same transaction, so they can never disagree with seq.
+		commit: func(ctx context.Context, j sendJob, sres sink.Result) error {
+			if err := cp.Commit(cpKey, sh.ShardID, j.seq, sres.Result.RowsImported, j.cur, j.deltas); err != nil {
+				return fmt.Errorf("checkpoint commit %s/%s chunk %d: %w", label, sh.ShardID, j.seq, err)
+			}
+			snd.sent++
+			snd.rows += sres.Result.RowsImported
+			prog.noteActivity(actKey)
+			prog.addChunk(int64(len(j.lp)), sres.Result.RowsImported)
+			prog.logf("[%s/%s] chunk %d: %d bytes raw → %d rows", label, sh.ShardID, j.seq, len(j.lp), sres.Result.RowsImported)
+			return nil
+		},
 	})
-	defer snd.wait() // never leak the sender goroutine on an error return
+	defer snd.wait() // never leak sender goroutines on an error return
 
 	// Measurement resolution is cached per name: shards emit points grouped by
 	// series, so the same measurement string recurs in long runs.
@@ -381,6 +390,7 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 
 	var acc *chunk.Accumulator
 	acc = chunk.NewAt(cfg.chunkSize, startSeq, func(ctx context.Context, seq int, lpBytes []byte, m chunk.Marker) error {
+
 		// Legacy resume: chunk already durably in Arc — re-derived, not re-sent.
 		// The baseline still advances so the first NEW chunk's audit delta only
 		// covers its own lines.
@@ -393,7 +403,7 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 		}
 		deltas := tallyDeltas(m.Tally, baseline, resCache)
 		baseline = m.Tally
-		if snd.pipelined {
+		if snd.pipelined() {
 			// Reuse buffers the sender has finished with, then hand this one off.
 			for _, b := range snd.reclaim() {
 				acc.Recycle(b)
@@ -407,6 +417,12 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 			deltas: deltas,
 		})
 	})
+
+	if cfg.inflight > 1 {
+		// K in-flight chunks means up to K detached buffers cycling through the
+		// pool; let the accumulator keep that many spares instead of reallocating.
+		acc.SpareCapacity(cfg.inflight + 1)
+	}
 
 	scratch := make([]byte, 0, 64<<10) // reused per-line encode buffer
 	var appendErr error
@@ -480,70 +496,157 @@ type sendJob struct {
 	deltas []checkpoint.ActionDelta
 }
 
-// sender runs a shard's send+commit stage, either inline (submit blocks through
-// the whole POST) or pipelined behind a single goroutine (submit hands off and
-// returns; the unbuffered channel bounds the pipeline to one chunk in flight
-// while the next accumulates). A single goroutine keeps commits in seq order.
-type sender struct {
+// senderConfig wires one shard's send pipeline.
+type senderConfig struct {
 	pipelined bool
-	process   func(context.Context, sendJob) error
+	inflight  int // max concurrent POSTs (1 = classic depth-1 pipeline)
+	firstSeq  int // seq of the first chunk this run will submit (committed+1)
+	post      func(context.Context, sendJob) (sink.Result, error)
+	commit    func(context.Context, sendJob, sink.Result) error
+}
 
-	jobs  chan sendJob
-	done  chan struct{}
-	spare chan []byte
-	once  sync.Once
+// sendResult carries one finished POST — success or failure — to the
+// committer. Errors MUST flow through here too: the committer advances only on
+// contiguous sequence numbers, and a seq whose result never arrives would
+// deadlock the drain barrier.
+type sendResult struct {
+	job sendJob
+	res sink.Result
+	err error
+}
+
+// sender runs a shard's send+commit stage.
+//
+// Inline mode (--pipeline=false): submit POSTs and commits synchronously.
+//
+// Pipelined mode: up to `inflight` worker goroutines POST concurrently while a
+// single committer applies commits in STRICT sequence order — commit(n) happens
+// only after every seq <= n succeeded. That preserves the resume invariant
+// (committed prefix == fully acked prefix) at any concurrency. The price of
+// K > 1 is a wider failure window: when seq n fails after n+1..n+K-1 were
+// already accepted by Arc, those later chunks are in Arc but never committed,
+// so the resume re-sends them — duplicates bounded by `inflight` chunks per
+// shard (K=1 keeps the historical <=1-chunk bound; see DESIGN §6.5).
+//
+// A token semaphore bounds OUTSTANDING chunks (submitted but not yet retired)
+// to `inflight`, so detached-buffer memory is inflight+1 chunk buffers per
+// shard, and the results channel (cap inflight) can never block a worker.
+type sender struct {
+	cfg senderConfig
+
+	tokens  chan struct{}
+	jobs    chan sendJob
+	results chan sendResult
+	done    chan struct{}
+	spare   chan []byte
+	once    sync.Once
 
 	mu  sync.Mutex
 	err error
 
-	// sent/rows are written by the sender goroutine (or inline submit) and read
-	// after wait() — the done channel orders that read.
+	// sent/rows are written by the committer (or inline submit) and read after
+	// wait() — the done channel orders that read.
 	sent, rows int64
 }
 
-func newSender(ctx context.Context, pipelined bool, process func(context.Context, sendJob) error) *sender {
-	s := &sender{pipelined: pipelined, process: process}
-	if !pipelined {
+func newSender(ctx context.Context, cfg senderConfig) *sender {
+	if cfg.inflight < 1 {
+		cfg.inflight = 1
+	}
+	s := &sender{cfg: cfg}
+	if !cfg.pipelined {
 		return s
 	}
+	k := cfg.inflight
+	s.tokens = make(chan struct{}, k)
 	s.jobs = make(chan sendJob)
+	s.results = make(chan sendResult, k)
 	s.done = make(chan struct{})
-	s.spare = make(chan []byte, 2)
+	s.spare = make(chan []byte, k+1)
+
+	// POST workers: every job yields exactly one result, error or not.
+	var wg sync.WaitGroup
+	for i := 0; i < k; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range s.jobs {
+				res, err := s.cfg.post(ctx, j)
+				s.results <- sendResult{job: j, res: res, err: err}
+			}
+		}()
+	}
+	go func() { wg.Wait(); close(s.results) }()
+
+	// Committer: single goroutine, strict seq order via a pending map. After
+	// the first failure (in seq order) nothing further commits, but every
+	// result is still retired so tokens release and the drain completes.
 	go func() {
 		defer close(s.done)
-		for j := range s.jobs {
-			if s.takeErr() != nil {
-				continue // failed: drain remaining jobs so submit never deadlocks
+		next := cfg.firstSeq
+		pending := map[int]sendResult{}
+		failed := false
+		for sr := range s.results {
+			if sr.err != nil {
+				s.setErr(sr.err) // reject new submits as early as possible
 			}
-			if err := s.process(ctx, j); err != nil {
-				s.setErr(err)
-				continue
-			}
-			select {
-			case s.spare <- j.lp[:0]:
-			default:
+			pending[sr.job.seq] = sr
+			for {
+				cur, ok := pending[next]
+				if !ok {
+					break
+				}
+				delete(pending, next)
+				if !failed {
+					if cur.err != nil {
+						failed = true
+						s.setErr(cur.err)
+					} else if err := s.cfg.commit(ctx, cur.job, cur.res); err != nil {
+						failed = true
+						s.setErr(err)
+					}
+				}
+				select {
+				case s.spare <- cur.job.lp[:0]:
+				default:
+				}
+				<-s.tokens
+				next++
 			}
 		}
 	}()
 	return s
 }
 
-// submit delivers one chunk. Inline mode processes it synchronously; pipelined
-// mode blocks only until the sender goroutine is free (depth-1 pipeline).
+// submit delivers one chunk. Inline mode POSTs and commits synchronously;
+// pipelined mode blocks only while `inflight` chunks are already outstanding.
 func (s *sender) submit(ctx context.Context, j sendJob) error {
-	if !s.pipelined {
-		return s.process(ctx, j)
+	if !s.cfg.pipelined {
+		res, err := s.cfg.post(ctx, j)
+		if err != nil {
+			return err
+		}
+		return s.cfg.commit(ctx, j, res)
 	}
 	if err := s.takeErr(); err != nil {
 		return err
 	}
 	select {
-	case s.jobs <- j:
-		return nil
+	case s.tokens <- struct{}{}:
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	select {
+	case s.jobs <- j:
+		return nil
+	case <-ctx.Done():
+		<-s.tokens
+		return ctx.Err()
+	}
 }
+
+// pipelined reports whether the sender detaches buffers (pipelined mode).
+func (s *sender) pipelined() bool { return s.cfg.pipelined }
 
 // reclaim returns buffers the sender has finished with (pipelined mode only).
 func (s *sender) reclaim() [][]byte {
@@ -558,10 +661,11 @@ func (s *sender) reclaim() [][]byte {
 	}
 }
 
-// wait closes the pipeline, blocks until every submitted chunk is processed,
-// and returns the first error. Idempotent — also used as the error-path drain.
+// wait closes the pipeline, blocks until every submitted chunk is retired
+// (committed, or drained past a failure), and returns the first error.
+// Idempotent — also used as the error-path drain.
 func (s *sender) wait() error {
-	if s.pipelined {
+	if s.cfg.pipelined {
 		s.once.Do(func() { close(s.jobs) })
 		<-s.done
 	}
