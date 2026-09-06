@@ -72,7 +72,7 @@ func TestAnalyzeRedactStripsIdentifiers(t *testing.T) {
 	// compare. (Identifiers are hex-free-form, so compare only numeric runs per
 	// line position after removing name tokens is fragile; instead assert the
 	// headline counters match.)
-	for _, marker := range []string{"4 series", "1 tsm files", "4 keys"} {
+	for _, marker := range []string{"4 series groups", "1 tsm files", "4 key entries"} {
 		if !strings.Contains(redacted, marker) {
 			t.Errorf("redacted report lost shape data %q", marker)
 		}

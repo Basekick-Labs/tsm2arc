@@ -18,6 +18,7 @@ type progress struct {
 	totalShards int64
 	verbose     bool
 	start       time.Time
+	stallWarn   time.Duration // 0 disables the stall warning
 
 	shardsDone atomic.Int64
 	chunks     atomic.Int64
@@ -29,18 +30,91 @@ type progress struct {
 	stop     chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
+
+	// actMu guards per-shard activity state and the last send error. Activity =
+	// a committed chunk OR a legacy-resume skip; ages are measured from
+	// max(shard start, last activity) so a freshly started shard is never
+	// instantly "stalled" during its index pass.
+	actMu    sync.Mutex
+	activity map[string]time.Time // active shards → last activity (seeded at start)
+	warned   map[string]bool      // stall warning armed-once per quiet period
+	sendErr  string               // last failed-send log line (cleared on activity)
+	sendErrT time.Time
 }
 
-func newProgress(totalShards int64, verbose bool) *progress {
+func newProgress(totalShards int64, verbose bool, stallWarn time.Duration) *progress {
 	p := &progress{
 		totalShards: totalShards,
 		verbose:     verbose,
+		stallWarn:   stallWarn,
 		start:       time.Now(),
 		stop:        make(chan struct{}),
+		activity:    map[string]time.Time{},
+		warned:      map[string]bool{},
 	}
 	p.wg.Add(1)
 	go p.heartbeatLoop()
 	return p
+}
+
+// shardStarted seeds the activity clock for a shard (see actMu comment).
+func (p *progress) shardStarted(key string) {
+	p.actMu.Lock()
+	p.activity[key] = time.Now()
+	p.warned[key] = false
+	p.actMu.Unlock()
+}
+
+// noteActivity records forward progress on a shard and clears any pending
+// stall state and send-error banner.
+func (p *progress) noteActivity(key string) {
+	p.actMu.Lock()
+	p.activity[key] = time.Now()
+	p.warned[key] = false
+	p.sendErr = ""
+	p.actMu.Unlock()
+}
+
+// shardFinished removes a shard from stall tracking.
+func (p *progress) shardFinished(key string) {
+	p.actMu.Lock()
+	delete(p.activity, key)
+	delete(p.warned, key)
+	p.actMu.Unlock()
+}
+
+// noteSendError records the latest failed-send message for the heartbeat, so
+// the difference between "slow merge" and "dying sends" is visible without
+// scrolling for log lines.
+func (p *progress) noteSendError(msg string) {
+	p.actMu.Lock()
+	p.sendErr = msg
+	p.sendErrT = time.Now()
+	p.actMu.Unlock()
+}
+
+// stallState returns the oldest active shard's idle age (ok=false when no
+// shard is active), any shards newly crossing the stall threshold (marked
+// warned), and the current send-error banner.
+func (p *progress) stallState() (oldest time.Duration, ok bool, newlyStalled []string, sendErr string, sendErrAge time.Duration) {
+	p.actMu.Lock()
+	defer p.actMu.Unlock()
+	now := time.Now()
+	for key, last := range p.activity {
+		idle := now.Sub(last)
+		if idle > oldest {
+			oldest = idle
+		}
+		ok = true
+		if p.stallWarn > 0 && idle >= p.stallWarn && !p.warned[key] {
+			p.warned[key] = true
+			newlyStalled = append(newlyStalled, key)
+		}
+	}
+	if p.sendErr != "" {
+		sendErr, sendErrAge = p.sendErr, now.Sub(p.sendErrT)
+	}
+	return
 }
 
 func (p *progress) addChunk(nbytes, rows int64) {
@@ -102,13 +176,25 @@ func (p *progress) printStatus(prefix string) {
 	if n := p.skipped.Load(); n > 0 {
 		skipped = fmt.Sprintf(" (+%d skipped on resume)", n)
 	}
+	oldest, active, newlyStalled, sendErr, sendErrAge := p.stallState()
+	idle := ""
+	if active {
+		idle = fmt.Sprintf(", oldest shard idle %s", oldest.Round(time.Second))
+	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	fmt.Printf("%s[%d/%d shards] %d chunks%s, %d rows, %.1f MB raw — %.0f rows/s, %.1f MB/s (%.0fs)\n",
+	fmt.Printf("%s[%d/%d shards] %d chunks%s, %d rows, %.1f MB raw — %.0f rows/s, %.1f MB/s (%.0fs)%s\n",
 		prefix,
 		p.shardsDone.Load(), p.totalShards,
 		p.chunks.Load(), skipped, rows, mb,
-		float64(rows)/elapsed, mb/elapsed, elapsed)
+		float64(rows)/elapsed, mb/elapsed, elapsed, idle)
+	if sendErr != "" {
+		fmt.Printf("  last send failure %s ago: %s\n", sendErrAge.Round(time.Second), sendErr)
+	}
+	p.mu.Unlock()
+	for _, key := range newlyStalled {
+		p.notef("WARN: shard %s has made no progress for over %s — sends may be stalled or retrying (see --send-timeout, --stall-warn)",
+			key, p.stallWarn)
+	}
 }
 
 // finish stops the heartbeat and prints a final status line.

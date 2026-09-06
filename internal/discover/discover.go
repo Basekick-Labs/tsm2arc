@@ -66,11 +66,27 @@ func Detect(path string) (dataDir string, version Version) {
 			return p, Version2
 		}
 	}
-	// 1.x: a data dir whose children are <db>/<rp>/<shard>
+	// 1.x: a data dir whose children are <db>/<rp>/<shard>. A candidate that is
+	// 1.x-SHAPED but unreadable (0700 root-owned db dirs are the norm for real
+	// InfluxDB data dirs) is remembered: if no candidate yields positive
+	// evidence, we resolve to the first unreadable-but-shaped one so the walk
+	// fails AT THE RIGHT LEVEL with an accurate permission error. Before this,
+	// an unreadable <root>/data made detection fall through to <root> itself,
+	// where the walk then treated "data" as a database and "_internal" as a
+	// retention policy — producing a permission error on a directory the run
+	// was configured to skip.
+	var unreadableCandidate string
 	for _, p := range []string{filepath.Join(path, "data"), path} {
-		if looksLike1x(p) {
+		shaped, unreadable := looksLike1x(p)
+		if shaped {
 			return p, Version1
 		}
+		if unreadable && unreadableCandidate == "" {
+			unreadableCandidate = p
+		}
+	}
+	if unreadableCandidate != "" {
+		return unreadableCandidate, Version1
 	}
 	return path, VersionUnknown
 }
@@ -93,12 +109,17 @@ func isEngineData(dir string) bool {
 	return false
 }
 
-// looksLike1x reports whether dir resembles a 1.x data dir: a child db dir with
-// a retention-policy subdir (any name) that holds a shard dir.
-func looksLike1x(dir string) bool {
+// looksLike1x probes whether dir is a 1.x data dir. shaped is true only on
+// POSITIVE evidence: some <db>/<rp> subdir contains a numeric shard directory —
+// the actual 1.x shape. (The old check accepted any directory with a
+// dir-grandchild, which let a PARENT of the data dir qualify: /root with a
+// "data" child whose subdirs are dirs looked "1.x-shaped" one level too high.)
+// unreadable reports that a permission error blocked probing somewhere below,
+// i.e. the dir MIGHT be 1.x-shaped but could not be verified.
+func looksLike1x(dir string) (shaped, unreadable bool) {
 	dbs, err := os.ReadDir(dir)
 	if err != nil {
-		return false
+		return false, os.IsPermission(err)
 	}
 	for _, db := range dbs {
 		if !db.IsDir() {
@@ -106,15 +127,43 @@ func looksLike1x(dir string) bool {
 		}
 		rps, err := os.ReadDir(filepath.Join(dir, db.Name()))
 		if err != nil {
+			if os.IsPermission(err) {
+				unreadable = true
+			}
 			continue
 		}
 		for _, rp := range rps {
-			if rp.IsDir() && rp.Name() != "_series" {
-				return true
+			if !rp.IsDir() || rp.Name() == "_series" {
+				continue
+			}
+			shardDirs, err := os.ReadDir(filepath.Join(dir, db.Name(), rp.Name()))
+			if err != nil {
+				if os.IsPermission(err) {
+					unreadable = true
+				}
+				continue
+			}
+			for _, sd := range shardDirs {
+				if sd.IsDir() && isNumeric(sd.Name()) {
+					return true, unreadable
+				}
 			}
 		}
 	}
-	return false
+	return false, unreadable
+}
+
+// isNumeric reports whether s is a non-empty decimal string (1.x shard IDs).
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // isBucketID reports whether s is a 16-char lowercase-hex InfluxDB platform ID.
