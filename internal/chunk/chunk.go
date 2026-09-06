@@ -50,6 +50,7 @@ type Accumulator struct {
 
 	inFlush  bool
 	detached bool
+	spareCap int      // max recycled buffers to keep (default 2; see SpareCapacity)
 	spares   [][]byte // recycled buffers for detach replacement (small, bounded)
 }
 
@@ -71,6 +72,7 @@ func NewAt(maxBytes, startSeq int, flush FlushFunc) *Accumulator {
 		flush:    flush,
 		buf:      make([]byte, 0, 1<<20),
 		seq:      startSeq,
+		spareCap: 2,
 	}
 }
 
@@ -120,8 +122,17 @@ func (a *Accumulator) Detach() {
 // sender goroutine, route recycling through the goroutine that calls Append
 // (e.g. collect completed buffers over a channel).
 func (a *Accumulator) Recycle(buf []byte) {
-	if len(a.spares) < 2 {
+	if len(a.spares) < a.spareCap {
 		a.spares = append(a.spares, buf[:0])
+	}
+}
+
+// SpareCapacity raises the recycled-buffer cap — with K chunks in flight
+// (--inflight) up to K+1 buffers cycle through detach/recycle, and a cap of 2
+// would silently drop most recycles into steady-state reallocation.
+func (a *Accumulator) SpareCapacity(n int) {
+	if n > a.spareCap {
+		a.spareCap = n
 	}
 }
 

@@ -275,6 +275,15 @@ Guidance:
 You can also lower `--chunk-bytes` to reduce per-request memory (e.g.
 `--chunk-bytes 200MB`), at the cost of more requests.
 
+### Upload concurrency (`--inflight`)
+
+When extraction outruns the network — few fat shards, chunks acked in seconds,
+CPU mostly idle — the ceiling is one in-flight POST per shard. `--inflight 2`
+or `3` sends that many chunks per shard concurrently while commits still apply
+strictly in order, typically 2–3× on the tail phase. Costs: host and Arc memory
+scale with it (see above), and the tagless duplicate bound becomes ≤inflight
+chunks per shard on an unclean crash. Resume works across different values.
+
 ### Intra-shard parallelism (`--shard-split`)
 
 When a few large shards dominate wall-clock and cores sit idle, `--shard-split N`
@@ -304,13 +313,16 @@ Separately from the Arc node, watch the **migration host's** own RAM:
   does **not** grow with the shard, the dataset, or the largest series — measured
   at 3.7 / 3.8 / 3.9 MiB for series of 500 K / 2 M / 8 M values.
 - **The load adds the chunk buffers**: each worker holds up to `--chunk-bytes`
-  of raw line protocol being accumulated, and (since 0.1.5) a second chunk in
-  flight to Arc — extraction and upload overlap by default. Budget roughly
-  `workers × 2 × chunk-bytes` (e.g. `4 × 2 × 450 MB ≈ 3.6 GB`); `--pipeline=false`
-  reverts to serial send and the pre-0.1.5 `workers × chunk-bytes`. This
-  dominates, and these are the only migration-host knobs worth turning. If the
-  host is memory constrained, lower `--chunk-bytes` and/or `--workers` — none of
-  the three affects correctness or resume.
+  being accumulated plus `--inflight` chunks in flight to Arc (default 1 —
+  extraction and upload overlap). Budget roughly
+  `workers × (inflight + 1) × chunk-bytes` on the host; `--pipeline=false`
+  reverts to serial send and `workers × chunk-bytes`. **Arc's side scales the
+  same way**: each in-flight import is buffered decompressed server-side, so
+  size `workers × inflight × chunk-bytes` against the Arc node's RAM — and
+  behind a load balancer assume the worst case lands on ONE writer. These are
+  the only knobs worth turning; none of them affects correctness or resume,
+  but `--inflight > 1` widens the unclean-crash duplicate bound for tagless
+  series from ≤1 to ≤inflight chunks per shard (see DESIGN §6).
 - **The index cache adds a bounded budget**: each in-flight shard caches parsed
   TSM file indexes (up to `--index-cache`, default 2 GiB) so per-series file
   reopens don't re-parse them. Worst case adds `workers × index-cache` to the

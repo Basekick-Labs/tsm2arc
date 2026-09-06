@@ -118,6 +118,11 @@ natural root and it resolves the rest:
 #   --precision ns|us|ms|s   precision value sent to Arc (default ns; tsm2arc always emits ns)
 #   --include-internal       also migrate InfluxDB 1.x's _internal database
 #                            (2.x system buckets _monitoring/_tasks are always skipped)
+#   --inflight N             concurrent import POSTs per shard (default 1);
+#                            commits stay strictly ordered, so resume is exact
+#                            at any value. >1 widens the tagless crash-duplicate
+#                            bound to <=N chunks/shard and multiplies host and
+#                            Arc memory (see the runbook)
 #   --pipeline               overlap extraction with upload (default true; =false
 #                            reverts to serial send and saves one chunk buffer
 #                            of memory per worker)

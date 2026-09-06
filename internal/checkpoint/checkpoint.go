@@ -13,9 +13,10 @@
 // Crash semantics: a chunk's checkpoint is written ONLY after its import returns
 // 2xx (and Arc's import handler FlushAll()s before returning, so 2xx == durably
 // persisted). The only overlap window is a crash between Arc persisting a chunk
-// and us recording it: on resume that one chunk is re-sent, producing duplicate
+// and us recording it: on resume those chunks are re-sent, producing duplicate
 // rows that Arc compaction collapses for tag-bearing series (tagless series
-// duplicate — bounded to <=1 chunk per shard per crash; see DESIGN.md §6).
+// duplicate — bounded to <=--inflight chunks per shard per crash, <=1 at the
+// default; see DESIGN.md §6).
 //
 // The store uses SQLite in WAL mode with synchronous=FULL so each checkpoint
 // commit is durable against process and OS crashes.

@@ -109,11 +109,12 @@ func main() {
 		endStr       = flag.String("end", "", "only points <= this RFC3339 UTC time (skips out-of-window TSM blocks unread)")
 		precision    = flag.String("precision", "ns", "LP timestamp precision: ns|us|ms|s")
 		checkpointDB = flag.String("checkpoint", "tsm2arc.checkpoint.db", "SQLite resume store path")
-		workers      = flag.Int("workers", 2, "concurrent shards to migrate (each holds ~chunk-bytes; Arc buffers each server-side)")
+		workers      = flag.Int("workers", 2, "concurrent shards to migrate; host and Arc each buffer ~workers*inflight*chunk-bytes for in-flight imports")
 		dryRun       = flag.Bool("dry-run", false, "extract + count, do not write to Arc")
 		sampleN      = flag.Int("sample", 5, "print up to N sample LP lines per database (dry-run)")
 		verbose      = flag.Bool("verbose", false, "verbose per-shard/chunk logging")
 		pipeline     = flag.Bool("pipeline", true, "overlap extraction with upload (one extra chunk buffer per worker); =false reverts to serial send")
+		inflight     = flag.Int("inflight", 1, "concurrent import POSTs per shard; commits still apply strictly in order. >1 widens the crash-duplicate window from <=1 to <=inflight chunks per shard, and Arc buffers workers*inflight chunks server-side. Requires --pipeline")
 		analyze      = flag.Bool("analyze", false, "index-only shard analysis (no data decoded, nothing sent): series/file/key counts and window-split profiles per shard")
 		analyzeRuns  = flag.Int("analyze-runs", 5, "with --analyze (text output): show the N largest runs per shard, 0 = all")
 		formatFlag   = flag.String("format", "text", "with --analyze: text|json. json always contains every run of every shard (--analyze-runs does not apply) and only the report goes to stdout")
@@ -169,6 +170,12 @@ func main() {
 	}
 	if *shardSplit < 1 {
 		fatal("--shard-split must be >= 1")
+	}
+	if *inflight < 1 {
+		fatal("--inflight must be >= 1")
+	}
+	if *inflight > 1 && !*pipeline {
+		fatal("--inflight > 1 requires --pipeline (concurrent sends are part of the pipelined path)")
 	}
 	if *redact && !*analyze {
 		fatal("--redact applies to --analyze output; add --analyze (load and --dry-run output are not meant to leave your organization)")
@@ -357,6 +364,7 @@ func main() {
 		verbose:     *verbose,
 		workers:     *workers,
 		pipeline:    *pipeline,
+		inflight:    *inflight,
 		indexCache:  int64(indexCacheSize),
 		split:       extract.SplitOptions{Workers: *shardSplit, MemoryBudget: int64(mergeMemory)},
 		redact:      *redact,
@@ -425,6 +433,7 @@ type runConfig struct {
 	verbose     bool
 	workers     int
 	pipeline    bool  // overlap extraction with send (see loadShard)
+	inflight    int   // concurrent POSTs per shard; commits stay strictly ordered
 	indexCache  int64 // per-shard budget for cached TSM indexes (0 = disabled)
 	split       extract.SplitOptions
 	redact      bool // --analyze only: pseudonymize identifiers in the report
