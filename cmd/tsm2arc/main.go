@@ -10,6 +10,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -114,6 +115,10 @@ func main() {
 		verbose      = flag.Bool("verbose", false, "verbose per-shard/chunk logging")
 		pipeline     = flag.Bool("pipeline", true, "overlap extraction with upload (one extra chunk buffer per worker); =false reverts to serial send")
 		analyze      = flag.Bool("analyze", false, "index-only shard analysis (no data decoded, nothing sent): series/file/key counts and window-split profiles per shard")
+		analyzeRuns  = flag.Int("analyze-runs", 5, "with --analyze (text output): show the N largest runs per shard, 0 = all")
+		formatFlag   = flag.String("format", "text", "with --analyze: text|json. json always contains every run of every shard (--analyze-runs does not apply) and only the report goes to stdout")
+		sendTimeout  = flag.Duration("send-timeout", 0, "per-attempt deadline for one import POST (0 = auto: 2m + 1s per MiB of --chunk-bytes). It bounds dead connections; set it too low and healthy imports get re-sent, which can duplicate tagless rows")
+		stallWarn    = flag.Duration("stall-warn", 0, "warn when a shard commits or skips nothing for this long (0 = auto: send-timeout + 2m, at least 5m); a negative value disables the warning")
 		redact       = flag.Bool("redact", false, "with --analyze: replace database, retention policy, and series names with stable hashed identifiers so the report can be shared without exposing internal names")
 		shardSplit   = flag.Int("shard-split", 1, "max concurrent merge tasks per shard (intra-shard parallelism; output is byte-identical to 1). Requires --merge-memory when > 1")
 		inclInternal = flag.Bool("include-internal", false, "include InfluxDB 1.x's _internal database (2.x system buckets are always skipped)")
@@ -168,6 +173,41 @@ func main() {
 	if *redact && !*analyze {
 		fatal("--redact applies to --analyze output; add --analyze (load and --dry-run output are not meant to leave your organization)")
 	}
+	if *formatFlag != "text" && *formatFlag != "json" {
+		fatal("--format must be text or json")
+	}
+	if *formatFlag == "json" && !*analyze {
+		fatal("--format=json currently applies to --analyze only")
+	}
+	if *analyzeRuns < 0 {
+		fatal("--analyze-runs must be >= 0")
+	}
+	if *sendTimeout != 0 && *sendTimeout < 5*time.Second {
+		fatal("--send-timeout must be at least 5s (it is a per-attempt deadline, not a rate limit)")
+	}
+	// Derived defaults: the send deadline scales with chunk size because Arc
+	// flushes to storage before acking, and the stall warning sits above the
+	// deadline so a warning always implies at least one failed attempt or a
+	// genuinely long merge.
+	effSendTimeout := *sendTimeout
+	if effSendTimeout == 0 {
+		effSendTimeout = 2*time.Minute + time.Duration(int64(chunkBytes)/(1<<20))*time.Second
+	}
+	effStallWarn := *stallWarn
+	if effStallWarn == 0 {
+		effStallWarn = effSendTimeout + 2*time.Minute
+		if effStallWarn < 5*time.Minute {
+			effStallWarn = 5 * time.Minute
+		}
+	} else if effStallWarn < 0 {
+		effStallWarn = 0
+	}
+	// stdout stays pure in --format=json: everything informational goes to
+	// stderr so the report is the only thing on stdout.
+	infow := io.Writer(os.Stdout)
+	if *formatFlag == "json" {
+		infow = os.Stderr
+	}
 	if *shardSplit > 1 && mergeMemory <= 0 {
 		fatal("--merge-memory is required with --shard-split > 1: concurrent merges are bounded by memory, not worker count.\n" +
 			"  Size it against the migration host: roughly (free RAM - workers×2×chunk-bytes - index caches) / workers.\n" +
@@ -220,13 +260,13 @@ func main() {
 	var bucketMap *buckets.Mapping
 	switch ver {
 	case discover.Version2:
-		fmt.Printf("detected InfluxDB 2.x layout at %s\n", resolvedData)
+		fmt.Fprintf(infow, "detected InfluxDB 2.x layout at %s\n", resolvedData)
 		if wd == "" {
 			// engine/wal sits next to engine/data
 			cand := filepath.Join(filepath.Dir(resolvedData), "wal")
 			if fi, err := os.Stat(cand); err == nil && fi.IsDir() {
 				wd = cand
-				fmt.Printf("using WAL dir %s\n", wd)
+				fmt.Fprintf(infow, "using WAL dir %s\n", wd)
 			}
 		}
 		boltPath := *boltFile
@@ -238,21 +278,21 @@ func main() {
 			// A bad --bolt path shouldn't hard-fail a TB migration: warn and fall
 			// back to bucket IDs (same as a missing bolt). The operator can re-run
 			// with a correct --bolt to get names; data still migrates.
-			fmt.Printf("WARN: could not read bucket metadata (%s): %v\n"+
+			fmt.Fprintf(infow, "WARN: could not read bucket metadata (%s): %v\n"+
 				"      falling back to bucket IDs as database names; system buckets cannot be identified\n",
 				boltPath, err)
 			bucketMap = nil
 		}
 		if bucketMap.Empty() {
-			fmt.Printf("WARN: no bucket name mapping (influxd.bolt at %s missing or empty).\n"+
+			fmt.Fprintf(infow, "WARN: no bucket name mapping (influxd.bolt at %s missing or empty).\n"+
 				"      Buckets will migrate under their 16-hex IDs and the _monitoring/_tasks\n"+
 				"      system buckets CANNOT be skipped. Provide --bolt or copy influxd.bolt\n"+
 				"      next to the engine/ dir to get names and system-bucket filtering.\n", boltPath)
 		}
 	case discover.Version1:
-		fmt.Printf("detected InfluxDB 1.x layout at %s\n", resolvedData)
+		fmt.Fprintf(infow, "detected InfluxDB 1.x layout at %s\n", resolvedData)
 	default:
-		fmt.Printf("WARN: could not detect InfluxDB layout at %s; treating as a 1.x data dir\n", *datadir)
+		fmt.Fprintf(infow, "WARN: could not detect InfluxDB layout at %s; treating as a 1.x data dir\n", *datadir)
 	}
 
 	// For 1.x, filter by db name in discovery; for 2.x, discovery keys on bucket
@@ -301,25 +341,28 @@ func main() {
 		fatal("no shards with TSM/WAL data found under %s", *datadir)
 	}
 
-	fmt.Printf("discovered %d shard(s) [%s]\n", len(shards), ver)
+	fmt.Fprintf(infow, "discovered %d shard(s) [%s]\n", len(shards), ver)
 	if wd == "" {
-		fmt.Println("NOTE: no WAL dir; uncompacted WAL data (if any) will not be read")
+		fmt.Fprintln(infow, "NOTE: no WAL dir; uncompacted WAL data (if any) will not be read")
 	}
 
 	ctx := context.Background()
 	cfg := runConfig{
-		shards:     shards,
-		start:      start,
-		end:        end,
-		chunkSize:  int(chunkBytes),
-		dbMap:      dbMap,
-		resolver:   resolver,
-		verbose:    *verbose,
-		workers:    *workers,
-		pipeline:   *pipeline,
-		indexCache: int64(indexCacheSize),
-		split:      extract.SplitOptions{Workers: *shardSplit, MemoryBudget: int64(mergeMemory)},
-		redact:     *redact,
+		shards:      shards,
+		start:       start,
+		end:         end,
+		chunkSize:   int(chunkBytes),
+		dbMap:       dbMap,
+		resolver:    resolver,
+		verbose:     *verbose,
+		workers:     *workers,
+		pipeline:    *pipeline,
+		indexCache:  int64(indexCacheSize),
+		split:       extract.SplitOptions{Workers: *shardSplit, MemoryBudget: int64(mergeMemory)},
+		redact:      *redact,
+		analyzeRuns: *analyzeRuns,
+		jsonOut:     *formatFlag == "json",
+		stallWarn:   effStallWarn,
 	}
 
 	if *analyze {
@@ -346,7 +389,8 @@ func main() {
 		fatal("%v", err)
 	}
 
-	snk := sink.New(*arcURL, *token, *precision)
+	fmt.Printf("send timeout %s per attempt, stall warning after %s of no shard progress\n", effSendTimeout, effStallWarn)
+	snk := sink.New(*arcURL, *token, *precision, sink.WithTimeout(effSendTimeout))
 	runLoad(ctx, cfg, snk, cp)
 }
 
@@ -372,18 +416,21 @@ func configFingerprint(cfg runConfig, precision string) string {
 
 // runConfig is the shared input for both dry-run and load.
 type runConfig struct {
-	shards     []discover.Shard
-	start      int64
-	end        int64
-	chunkSize  int
-	dbMap      map[string]string
-	resolver   *measure.Resolver // nil (tests) = pass-through, no validation
-	verbose    bool
-	workers    int
-	pipeline   bool  // overlap extraction with send (see loadShard)
-	indexCache int64 // per-shard budget for cached TSM indexes (0 = disabled)
-	split      extract.SplitOptions
-	redact     bool // --analyze only: pseudonymize identifiers in the report
+	shards      []discover.Shard
+	start       int64
+	end         int64
+	chunkSize   int
+	dbMap       map[string]string
+	resolver    *measure.Resolver // nil (tests) = pass-through, no validation
+	verbose     bool
+	workers     int
+	pipeline    bool  // overlap extraction with send (see loadShard)
+	indexCache  int64 // per-shard budget for cached TSM indexes (0 = disabled)
+	split       extract.SplitOptions
+	redact      bool // --analyze only: pseudonymize identifiers in the report
+	analyzeRuns int  // --analyze text output: top-N runs per shard (0 = all)
+	jsonOut     bool // --analyze: emit the report as JSON on a pure stdout
+	stallWarn   time.Duration
 }
 
 func (c runConfig) arcDB(sourceDB string) string {

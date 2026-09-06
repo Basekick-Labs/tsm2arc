@@ -37,6 +37,8 @@ type Sink struct {
 	maxRetries int
 	baseDelay  time.Duration
 	maxDelay   time.Duration
+
+	logf func(format string, args ...any) // optional; see SetLogger
 }
 
 // Option configures a Sink.
@@ -54,6 +56,31 @@ func WithRetry(maxRetries int, base, max time.Duration) Option {
 // WithHTTPClient overrides the default tuned client (used by tests).
 func WithHTTPClient(c *http.Client) Option {
 	return func(s *Sink) { s.client = c }
+}
+
+// WithTimeout sets the per-attempt deadline for one import POST (dial + body
+// write + server processing + response). Arc flushes to storage before
+// answering, so the right value scales with chunk size; the cmd derives it
+// from --chunk-bytes unless --send-timeout overrides.
+//
+// A timeout that fires while a SUCCESSFUL import is still flushing converts
+// that success into a retry: the chunk is re-sent, and for tagless series the
+// duplicate can persist (same class as the documented crash window). That is
+// why the deadline is generous by default — it exists to bound a dead
+// connection, not to race healthy imports.
+func WithTimeout(d time.Duration) Option {
+	return func(s *Sink) { s.client.Timeout = d }
+}
+
+// SetLogger installs a retry/attempt logger. Call before Send is first used
+// (not synchronized). Without it, retries are silent until the final error —
+// which, behind a severed keep-alive, looks exactly like a hang from outside.
+func (s *Sink) SetLogger(logf func(format string, args ...any)) { s.logf = logf }
+
+func (s *Sink) log(format string, args ...any) {
+	if s.logf != nil {
+		s.logf(format, args...)
+	}
 }
 
 // New builds a Sink. baseURL is Arc's root (e.g. https://arc.example.net),
@@ -119,16 +146,41 @@ func (s *Sink) Send(ctx context.Context, db string, lp []byte) (Result, error) {
 				return Result{}, err
 			}
 		}
+		began := time.Now()
 		res, retryable, err := s.doOnce(ctx, url, db, contentType, body)
 		if err == nil {
+			if attempt > 0 {
+				s.log("import POST to %q recovered on attempt %d/%d", db, attempt+1, s.maxRetries+1)
+			}
 			return res, nil
 		}
 		lastErr = err
 		if !retryable {
 			return Result{}, err
 		}
+		// A retryable transport failure often means the pooled keep-alive is
+		// dead (e.g. a server rolled behind a proxy). Drop idle connections so
+		// the retry dials fresh instead of burning another full timeout on a
+		// second corpse from the pool.
+		s.client.CloseIdleConnections()
+		if attempt < s.maxRetries {
+			delay := s.backoffPreview(attempt + 1)
+			s.log("import POST to %q attempt %d/%d failed after %s (%d bytes raw): %v — retrying in ~%s",
+				db, attempt+1, s.maxRetries+1, time.Since(began).Round(time.Second), len(lp), err, delay.Round(time.Second))
+		}
 	}
+	s.log("import POST to %q giving up after %d attempts: %v", db, s.maxRetries+1, lastErr)
 	return Result{}, fmt.Errorf("giving up after %d attempts: %w", s.maxRetries+1, lastErr)
+}
+
+// backoffPreview returns the cap of the next attempt's jittered delay, for log
+// messages (the actual sleep picks uniformly in [0, cap]).
+func (s *Sink) backoffPreview(attempt int) time.Duration {
+	d := s.baseDelay << (attempt - 1)
+	if d > s.maxDelay || d <= 0 {
+		d = s.maxDelay
+	}
+	return d
 }
 
 // doOnce performs a single attempt. retryable indicates whether a failure is
@@ -140,6 +192,13 @@ func (s *Sink) doOnce(ctx context.Context, url, db, contentType string, body []b
 	}
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("x-arc-database", db)
+	// Expect: 100-continue makes the transport wait (ExpectContinueTimeout,
+	// 1s) for the server's go-ahead BEFORE writing a multi-MB body. Against a
+	// backend that just rolled away behind a proxy, the attempt fails in about
+	// a second instead of pushing a whole chunk into a black hole and waiting
+	// out the full request timeout. Servers/proxies that ignore the header
+	// just receive the body after the 1s grace — no behavior change.
+	req.Header.Set("Expect", "100-continue")
 	if s.token != "" {
 		req.Header.Set("Authorization", "Bearer "+s.token)
 	}

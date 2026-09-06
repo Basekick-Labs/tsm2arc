@@ -135,6 +135,15 @@ natural root and it resolves the rest:
 #   --analyze                index-only shard profile (fast; nothing decoded or
 #                            sent): series/file/key counts per shard and window-
 #                            split profiles for the largest merge runs
+#   --analyze-runs N         text output: show the N largest runs per shard
+#                            (default 5, labeled when it truncates; 0 = all)
+#   --format text|json       with --analyze: json emits EVERY run of every shard
+#                            as one JSON document on a pure stdout (for tooling)
+#   --send-timeout DUR       per-attempt deadline for one import POST (default
+#                            auto: 2m + 1s per MiB of --chunk-bytes). Bounds dead
+#                            connections; too low re-sends healthy imports
+#   --stall-warn DUR         warn when a shard makes no progress for this long
+#                            (default auto: send-timeout + 2m, min 5m)
 #   --redact                 with --analyze: replace database, retention policy,
 #                            and series names with stable hashed identifiers so
 #                            the report can be shared outside your organization

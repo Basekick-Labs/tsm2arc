@@ -135,6 +135,13 @@ can help your data shape.
 tsm2arc --datadir /mnt/influx/data --analyze
 ```
 
+Text output shows the 5 largest runs per shard and says so when it truncates
+(`--analyze-runs=0` prints everything). For tooling, use `--format=json`: one
+JSON document with EVERY run of every shard, every metric, no cap — nothing
+else on stdout. Note the header terms: "series groups" are distinct
+measurement+tag-set keys, "key entries" count per-file index keys (the same
+field across 3 TSM generations counts 3).
+
 If the report must leave your organization (support tickets, issues), add
 `--redact`: database, retention policy, and series names are replaced with
 stable hashed pseudonyms (`series_3f9a2c1b04d7`), so the report carries every
@@ -177,6 +184,14 @@ Mapping:
 ---
 
 ## 3a. Handle measurement names Arc rejects
+
+> Since 0.1.9, a load under the default `--on-invalid-measurement=fail` runs a
+> pre-flight census: every measurement name in the (time-windowed) corpus is
+> checked against your map BEFORE the first POST, and a failure lists every
+> offending name at once — so one map fix covers all of them, and an unmapped
+> name costs seconds, not a reload hours in. The census reads only TSM indexes
+> and WAL keys; it does not decode data.
+
 
 Arc accepts only measurement names matching `^[a-zA-Z][a-zA-Z0-9_-]*$` (the dot
 is Arc's `database.measurement` separator in queries and RBAC grant keys, so it
@@ -360,6 +375,30 @@ progressing rather than looking like a hang.
   resume works.
 - Avoid running two `tsm2arc` processes against the **same checkpoint file** at
   once. Use one process; scale with `--workers`.
+
+---
+
+### When a writer restarts mid-load
+
+A rolling restart of Arc (or anything that severs keep-alive connections, e.g.
+behind an L7 proxy) makes the in-flight POST wait out its deadline, then retry.
+Since 0.1.9 that is visible and bounded:
+
+- every import attempt has a deadline (`--send-timeout`, auto-derived from
+  `--chunk-bytes`), each failed attempt logs one line with the backoff chosen,
+  and the retry opens a fresh connection instead of reusing a dead one;
+- requests send `Expect: 100-continue`, so a dead backend usually fails the
+  attempt in about a second instead of after a full body write;
+- the heartbeat shows the oldest shard's idle age, prints the last send failure,
+  and emits a WARN once a shard exceeds `--stall-warn` — so a stalled load is an
+  alert line, not twelve quiet minutes;
+- when the whole retry budget is spent the process exits non-zero, and a plain
+  re-run resumes exactly where it left off.
+
+Do not set `--send-timeout` aggressively low: the deadline covers the server's
+flush-before-ack, and a timeout that races a SUCCESSFUL import re-sends the
+chunk — tag-bearing series dedupe at compaction, tagless rows can keep the
+duplicate (same class as the documented crash window).
 
 ---
 

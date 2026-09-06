@@ -164,14 +164,16 @@ func TestLoadFailsFastOnInvalidMeasurement(t *testing.T) {
 	if err == nil {
 		t.Fatal("load succeeded with invalid measurement names under fail policy")
 	}
-	for _, want := range []string{"edge-prod.gateway_services", "--measurement-map", "--on-invalid-measurement", "--dry-run"} {
+	// The pre-flight census must list EVERY offending name at once — one map
+	// fix covers all of them — and mention the remediation flags.
+	for _, want := range []string{"edge-prod.gateway_services", "qa.node-b", "pre-flight census", "--measurement-map", "--on-invalid-measurement"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error should mention %q; got:\n%v", want, err)
 		}
 	}
-	// The failure is client-side: nothing was sent, so no Arc 400 mid-load.
+	// The failure is client-side and pre-POST: nothing was sent at all.
 	if arc.requests != 0 {
-		t.Errorf("Arc saw %d request(s); fail policy must abort before sending", arc.requests)
+		t.Errorf("Arc saw %d request(s); the census must abort before sending", arc.requests)
 	}
 }
 

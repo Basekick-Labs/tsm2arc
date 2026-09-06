@@ -222,7 +222,19 @@ func load(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoint.Sto
 		workers = 1
 	}
 
-	prog := newProgress(int64(len(jobs)), cfg.verbose)
+	// Pre-flight measurement census (fail policy only): every name that would
+	// abort the load is caught here, before the first POST and before the
+	// heartbeat starts, so a bad map costs seconds instead of hours.
+	if err := censusMeasurements(cfg, cp, jobs); err != nil {
+		return res, err
+	}
+
+	prog := newProgress(int64(len(jobs)), cfg.verbose, cfg.stallWarn)
+	snk.SetLogger(func(format string, args ...any) {
+		msg := fmt.Sprintf(format, args...)
+		prog.notef("%s", msg)
+		prog.noteSendError(msg)
+	})
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(workers)
 	for i := range jobs {
@@ -287,6 +299,7 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 	// bucket (and into the wrong Arc db). The label is just for log lines.
 	cpKey := sh.SourceID
 	label := sh.Database
+	actKey := label + "/" + sh.ShardID
 
 	done, err := cp.IsShardDone(cpKey, sh.ShardID)
 	if err != nil {
@@ -298,6 +311,11 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 		prog.shardDone()
 		return r, nil
 	}
+
+	// Seed the activity clock so the stall warning measures from shard start,
+	// not from epoch — the index pass alone can be minutes on a fat shard.
+	prog.shardStarted(actKey)
+	defer prog.shardFinished(actKey)
 
 	committed, cur, err := cp.Progress(cpKey, sh.ShardID)
 	if err != nil {
@@ -328,6 +346,7 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 		}
 		snd.sent++
 		snd.rows += sres.Result.RowsImported
+		prog.noteActivity(actKey)
 		prog.addChunk(int64(len(j.lp)), sres.Result.RowsImported)
 		prog.logf("[%s/%s] chunk %d: %d bytes raw → %d rows", label, sh.ShardID, j.seq, len(j.lp), sres.Result.RowsImported)
 		return nil
@@ -368,6 +387,7 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 		if seq <= committed {
 			r.skipped++
 			prog.addSkipped(1)
+			prog.noteActivity(actKey) // re-derive skips are forward progress too
 			baseline = m.Tally
 			return nil
 		}

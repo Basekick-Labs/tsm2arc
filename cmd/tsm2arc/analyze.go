@@ -3,7 +3,9 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"time"
 
@@ -14,13 +16,61 @@ import (
 // to show whether windows prune streams; the conclusion barely moves with K.
 const analyzeSplitK = 8
 
-// runAnalyze prints an index-only profile of every shard: series/file/key
-// counts and, for the largest merge runs, whether a K-way window split would
-// touch small stream subsets (split-friendly) or nearly all streams per window
-// (fully overlapping generations — a split would stay memory-bound). Nothing
-// is decoded and nothing is sent; runtime is proportional to index size.
+// analyzeSplitThreshold mirrors the extractor's minimum run size for
+// windowing; runs below it are never split, so their verdict says so.
+const analyzeSplitThreshold = 256 << 20
+
+// Report types — the single source for both text and JSON rendering, so the
+// two can never drift. JSON always carries EVERY run of every shard
+// (--analyze-runs applies to text only): machine output that silently
+// truncates is how a downstream sizing model ends up confidently wrong.
+type analyzeReport struct {
+	Version int `json:"version"`
+	// SplitThresholdBytes lets consumers reproduce the below-threshold verdict.
+	SplitThresholdBytes int64          `json:"split_threshold_bytes"`
+	Shards              []analyzeShard `json:"shards"`
+}
+
+type analyzeShard struct {
+	Database  string `json:"database"`
+	Retention string `json:"retention"`
+	ShardID   string `json:"shard_id"`
+	// SeriesGroups counts distinct series keys (measurement + tag set). For
+	// tagless data this equals the measurement count — it is NOT the per-field
+	// stream count; see KeyEntries.
+	SeriesGroups int `json:"series_groups"`
+	RunsTotal    int `json:"runs_total"`
+	TSMFiles     int `json:"tsm_files"`
+	// KeyEntries counts (file, key) index entries: the same series+field
+	// appearing in three TSM generations counts three times.
+	KeyEntries  int          `json:"key_entries"`
+	SkippedKeys int          `json:"skipped_keys,omitempty"`
+	Runs        []analyzeRun `json:"runs"` // sorted by bytes descending
+}
+
+type analyzeRun struct {
+	Series        string `json:"series"`
+	Files         int    `json:"files"`
+	Streams       int    `json:"streams"`
+	Blocks        int    `json:"blocks"`
+	Bytes         int64  `json:"bytes"`
+	MinTimeNs     int64  `json:"min_time_ns"`
+	MaxTimeNs     int64  `json:"max_time_ns"`
+	Windows       int    `json:"windows"`
+	WindowStreams []int  `json:"window_streams"`
+	// Verdict: "split-friendly", "overlapping", or "below-threshold".
+	Verdict string `json:"verdict"`
+	// EstResidentBytes = busiest window's streams × one decoded block (64 KiB):
+	// the rough resident footprint of merging that window.
+	EstResidentBytes int64 `json:"est_resident_bytes"`
+}
+
+// runAnalyze profiles every shard from its TSM indexes only (nothing decoded,
+// nothing sent), then renders text or JSON. The report is built COMPLETELY
+// before anything is written in JSON mode, so an error can never leave
+// truncated JSON on stdout.
 func runAnalyze(cfg runConfig) {
-	fmt.Println("\n=== SHARD ANALYSIS (index-only; no data decoded, nothing sent) ===")
+	rep := analyzeReport{Version: 1, SplitThresholdBytes: analyzeSplitThreshold}
 	order, byDB := shardsByDB(cfg.shards)
 	for _, db := range order {
 		for _, sh := range byDB[db] {
@@ -28,48 +78,89 @@ func runAnalyze(cfg runConfig) {
 			if err != nil {
 				fatal("analyze %s/%s: %v", sh.Database, sh.ShardID, err)
 			}
-			db, rp := sh.Database, sh.Retention
+			s := analyzeShard{
+				Database:     sh.Database,
+				Retention:    sh.Retention,
+				ShardID:      sh.ShardID,
+				SeriesGroups: an.Series,
+				RunsTotal:    len(an.Runs),
+				TSMFiles:     an.Files,
+				KeyEntries:   an.Keys,
+				SkippedKeys:  an.SkippedKey,
+			}
 			if cfg.redact {
-				db, rp = redactName("db", db), redactName("rp", rp)
+				s.Database = redactName("db", s.Database)
+				s.Retention = redactName("rp", s.Retention)
 			}
-			fmt.Printf("\nshard %s/%s/%s: %d series, %d tsm files, %d keys",
-				db, rp, sh.ShardID, an.Series, an.Files, an.Keys)
-			if an.SkippedKey > 0 {
-				fmt.Printf(", %d skipped keys", an.SkippedKey)
-			}
-			fmt.Println()
-
-			// Largest runs dominate wall-clock; show the top 5 by bytes.
 			runs := an.Runs
 			sort.Slice(runs, func(i, j int) bool { return runs[i].Bytes > runs[j].Bytes })
-			if len(runs) > 5 {
-				runs = runs[:5]
-			}
 			for _, r := range runs {
-				name := truncate(r.SeriesKey, 80)
+				name := r.SeriesKey
 				if cfg.redact {
 					name = redactName("series", r.SeriesKey)
 				}
-				fmt.Printf("  run: series=%s\n", name)
-				fmt.Printf("       %d files, %d streams, %d blocks, %s, %s .. %s\n",
-					r.Files, r.Streams, r.Blocks, fmtBytes(r.Bytes),
-					fmtDay(r.MinTime), fmtDay(r.MaxTime))
-				min, med, max := windowStats(r.WindowStreams)
-				fmt.Printf("       %d-way window profile: streams/window min=%d median=%d max=%d (of %d total)\n",
-					len(r.WindowStreams), min, med, max, r.Streams)
-				if r.Bytes < 256<<20 {
-					fmt.Printf("       verdict: below the split threshold — this run would never be windowed\n")
-					continue
+				_, _, max := windowStats(r.WindowStreams)
+				verdict := "split-friendly"
+				switch {
+				case r.Bytes < analyzeSplitThreshold:
+					verdict = "below-threshold"
+				case r.Streams > 0 && max*10 >= r.Streams*8:
+					verdict = "overlapping"
 				}
-				// Verdict: if the busiest window still touches most streams, a
-				// window split cannot shrink the resident decoded-block set.
-				if r.Streams > 0 && max*10 >= r.Streams*8 {
-					fmt.Printf("       verdict: OVERLAPPING — windows touch >=80%% of streams; a window split stays memory-bound (~%s decoded blocks resident per window)\n",
-						fmtBytes(int64(max)*64*1024))
-				} else {
-					fmt.Printf("       verdict: SPLIT-FRIENDLY — windows prune streams well (busiest window ~%s decoded blocks resident)\n",
-						fmtBytes(int64(max)*64*1024))
-				}
+				s.Runs = append(s.Runs, analyzeRun{
+					Series: name, Files: r.Files, Streams: r.Streams, Blocks: r.Blocks,
+					Bytes: r.Bytes, MinTimeNs: r.MinTime, MaxTimeNs: r.MaxTime,
+					Windows: len(r.WindowStreams), WindowStreams: r.WindowStreams,
+					Verdict: verdict, EstResidentBytes: int64(max) * 64 * 1024,
+				})
+			}
+			rep.Shards = append(rep.Shards, s)
+		}
+	}
+
+	if cfg.jsonOut {
+		enc := json.NewEncoder(os.Stdout)
+		if err := enc.Encode(rep); err != nil {
+			fatal("encode analyze report: %v", err)
+		}
+		return
+	}
+	renderAnalyzeText(cfg, rep)
+}
+
+func renderAnalyzeText(cfg runConfig, rep analyzeReport) {
+	fmt.Println("\n=== SHARD ANALYSIS (index-only; no data decoded, nothing sent) ===")
+	for _, s := range rep.Shards {
+		fmt.Printf("\nshard %s/%s/%s: %d series groups, %d runs, %d tsm files, %d key entries",
+			s.Database, s.Retention, s.ShardID, s.SeriesGroups, s.RunsTotal, s.TSMFiles, s.KeyEntries)
+		if s.SkippedKeys > 0 {
+			fmt.Printf(", %d skipped keys", s.SkippedKeys)
+		}
+		fmt.Println()
+
+		runs := s.Runs
+		if cfg.analyzeRuns > 0 && len(runs) > cfg.analyzeRuns {
+			fmt.Printf("  showing %d of %d runs (largest by compressed bytes) — NOT a complete list; --analyze-runs=0 for all, --format=json for machine-complete output\n",
+				cfg.analyzeRuns, len(runs))
+			runs = runs[:cfg.analyzeRuns]
+		}
+		for _, r := range runs {
+			fmt.Printf("  run: series=%s\n", truncate(r.Series, 80))
+			fmt.Printf("       %d files, %d streams, %d blocks, %s, %s .. %s\n",
+				r.Files, r.Streams, r.Blocks, fmtBytes(r.Bytes),
+				fmtDay(r.MinTimeNs), fmtDay(r.MaxTimeNs))
+			min, med, max := windowStats(r.WindowStreams)
+			fmt.Printf("       %d-way window profile: streams/window min=%d median=%d max=%d (of %d total)\n",
+				r.Windows, min, med, max, r.Streams)
+			switch r.Verdict {
+			case "below-threshold":
+				fmt.Printf("       verdict: below the split threshold — this run would never be windowed\n")
+			case "overlapping":
+				fmt.Printf("       verdict: OVERLAPPING — windows touch >=80%% of streams; a window split stays memory-bound (~%s decoded blocks resident per window)\n",
+					fmtBytes(r.EstResidentBytes))
+			default:
+				fmt.Printf("       verdict: SPLIT-FRIENDLY — windows prune streams well (busiest window ~%s decoded blocks resident)\n",
+					fmtBytes(r.EstResidentBytes))
 			}
 		}
 	}
