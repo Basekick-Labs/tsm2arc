@@ -37,6 +37,7 @@ import (
 	"strings"
 
 	"github.com/basekick-labs/tsm2arc/internal/extract"
+	"github.com/basekick-labs/tsm2arc/internal/lp"
 	"github.com/basekick-labs/tsm2arc/internal/v3meta"
 	"github.com/basekick-labs/tsm2arc/internal/vfs"
 )
@@ -54,6 +55,25 @@ type Table struct {
 	SeriesKey []string
 	// Files is the table's live set (from v3meta.BuildLiveSet).
 	Files []v3meta.ParquetFile
+	// Extra holds rows that exist outside the parquet files — decoded
+	// un-snapshotted WAL rows — keyed by their gen1 chunk_time (the WAL
+	// carries the same truncated chunk keys the persister would use). Extra
+	// rows always outrank file rows in LWW: they are strictly newer writes
+	// (their WAL sequences are above the snapshot high-water mark).
+	Extra map[int64][]MemRow
+}
+
+// MemRow is one in-memory row (a decoded WAL row). Tags may arrive in any
+// order but every tag name must be part of the table's series key — the
+// same completeness rule enforced for files. Rank orders rows among ALL of
+// the table's extra rows (WAL sequence, then op/row encounter order), so
+// duplicate (series, time) pairs within the WAL resolve deterministically
+// to the newest write.
+type MemRow struct {
+	Time   int64
+	Tags   [][2]string
+	Fields []lp.Field
+	Rank   int
 }
 
 // Options tunes extraction.
@@ -75,17 +95,21 @@ func (o Options) warnf(format string, args ...any) {
 // and a cursor that no longer matches the source fails loudly.
 func Extract(f vfs.FS, tbl Table, start, end int64, cur *extract.Cursor, opt Options, fn func(extract.Point)) (extract.Stats, error) {
 	var st extract.Stats
-	if len(tbl.Files) == 0 {
+	if len(tbl.Files) == 0 && len(tbl.Extra) == 0 {
 		return st, nil
 	}
 
-	buckets := bucketize(tbl.Files)
+	buckets := bucketize(tbl.Files, tbl.Extra)
 	if !bucketsDisjoint(buckets) {
 		opt.warnf("table %s: live files span bucket boundaries (gen1-duration changed mid-life?); falling back to one global merge", tbl.Key)
 		all := make([]v3meta.ParquetFile, len(tbl.Files))
 		copy(all, tbl.Files)
 		sortFilesLWW(all) // rank order must not depend on caller's file order
-		buckets = []bucket{{chunkTime: buckets[0].chunkTime, files: all}}
+		var extra []MemRow
+		for _, rows := range tbl.Extra {
+			extra = append(extra, rows...)
+		}
+		buckets = []bucket{{chunkTime: buckets[0].chunkTime, files: all, extra: extra}}
 	}
 
 	// Resume: the cursor's bucket must still exist, and the exact cursor
@@ -119,7 +143,7 @@ func Extract(f vfs.FS, tbl Table, start, end int64, cur *extract.Cursor, opt Opt
 		}
 		// Skip buckets fully outside [start, end]. MinTime/MaxTime come from
 		// the manifests; rows are filtered exactly below either way.
-		inRange := false
+		inRange := len(b.extra) > 0 // extra rows are filtered per row
 		for _, pf := range b.files {
 			if pf.MinTime <= end && pf.MaxTime >= start {
 				inRange = true
@@ -192,17 +216,23 @@ func observe(st *extract.Stats, ts int64) {
 type bucket struct {
 	chunkTime int64
 	files     []v3meta.ParquetFile
+	extra     []MemRow
 }
 
-func bucketize(files []v3meta.ParquetFile) []bucket {
+func bucketize(files []v3meta.ParquetFile, extra map[int64][]MemRow) []bucket {
 	byCT := map[int64][]v3meta.ParquetFile{}
 	for _, pf := range files {
 		byCT[pf.ChunkTime] = append(byCT[pf.ChunkTime], pf)
 	}
+	for ct := range extra {
+		if _, ok := byCT[ct]; !ok {
+			byCT[ct] = nil // WAL-only bucket: no files yet, rows exist
+		}
+	}
 	out := make([]bucket, 0, len(byCT))
 	for ct, fs := range byCT {
 		sortFilesLWW(fs)
-		out = append(out, bucket{chunkTime: ct, files: fs})
+		out = append(out, bucket{chunkTime: ct, files: fs, extra: extra[ct]})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].chunkTime < out[j].chunkTime })
 	return out
@@ -232,6 +262,11 @@ func bucketsDisjoint(buckets []bucket) bool {
 		for _, pf := range buckets[i].files {
 			if pf.MaxTime > maxT {
 				maxT = pf.MaxTime
+			}
+		}
+		for _, r := range buckets[i].extra {
+			if r.Time > maxT {
+				maxT = r.Time
 			}
 		}
 		if maxT >= buckets[i+1].chunkTime {

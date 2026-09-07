@@ -45,6 +45,40 @@ func readBucket(f vfs.FS, tbl Table, b bucket, start, end int64) ([]row, error) 
 			return nil, err
 		}
 	}
+	// Extra (WAL) rows outrank every file: their WAL sequences are above the
+	// snapshot high-water mark, so they are strictly newer writes. Their own
+	// caller-assigned Rank keeps WAL-internal duplicates deterministic.
+	var kb strings.Builder
+	for _, mr := range b.extra {
+		if mr.Time < start || mr.Time > end {
+			continue
+		}
+		if len(mr.Fields) == 0 {
+			continue
+		}
+		vals := make([]*string, len(tbl.SeriesKey))
+		for _, tg := range mr.Tags {
+			pos, ok := keyPos[tg[0]]
+			if !ok {
+				return nil, fmt.Errorf("WAL row tag %q is not in the table's series key %v — series key incomplete", tg[0], tbl.SeriesKey)
+			}
+			v := tg[1]
+			vals[pos] = &v
+		}
+		tags := make([][2]string, len(mr.Tags))
+		copy(tags, mr.Tags)
+		fields := make([]lp.Field, len(mr.Fields))
+		copy(fields, mr.Fields)
+		sort.Slice(tags, func(i, j int) bool { return tags[i][0] < tags[j][0] })
+		sort.Slice(fields, func(i, j int) bool { return fields[i].Name < fields[j].Name })
+		rows = append(rows, row{
+			orderKey: orderKey(&kb, vals),
+			ts:       mr.Time,
+			rank:     len(b.files) + mr.Rank,
+			tags:     tags,
+			fields:   fields,
+		})
+	}
 	sort.Slice(rows, func(i, j int) bool {
 		a, b := &rows[i], &rows[j]
 		if a.orderKey != b.orderKey {

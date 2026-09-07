@@ -9,6 +9,7 @@ import (
 
 	"github.com/basekick-labs/tsm2arc/internal/extract"
 	"github.com/basekick-labs/tsm2arc/internal/lp"
+	"github.com/basekick-labs/tsm2arc/internal/tsm"
 	"github.com/basekick-labs/tsm2arc/internal/v3meta"
 	"github.com/basekick-labs/tsm2arc/internal/vfs"
 )
@@ -275,5 +276,70 @@ func TestOrderKeyEncoding(t *testing.T) {
 			t.Fatalf("orderKey not strictly increasing at case %d", i)
 		}
 		prev = k
+	}
+}
+
+func TestExtraRowsWALSemantics(t *testing.T) {
+	f, tbl := cpuTable(t)
+	pts, _, _ := runExtract(t, f, tbl, math.MinInt64, math.MaxInt64, nil)
+
+	// Pick a persisted point and overwrite it via an "extra" (WAL) row, add a
+	// WAL-internal duplicate (rank decides), and a row in a brand-new bucket
+	// (a WAL-only table window).
+	victim := pts[len(pts)/2]
+	bucketOf := func(ts int64) int64 { return ts - ts%int64(time.Minute) }
+	newBucket := bucketOf(pts[len(pts)-1].UnixNano) + int64(10*time.Minute)
+
+	mkFields := func(v float64) []lp.Field {
+		return []lp.Field{{Name: "usage", Value: tsm.Value{Type: tsm.BlockFloat, Float: v}}}
+	}
+	tbl.Extra = map[int64][]MemRow{
+		bucketOf(victim.UnixNano): {
+			{Time: victim.UnixNano, Tags: victim.Tags, Fields: mkFields(111.5), Rank: 0}, // loses to rank 1
+			{Time: victim.UnixNano, Tags: victim.Tags, Fields: mkFields(222.5), Rank: 1}, // WAL-internal LWW winner
+		},
+		newBucket: {
+			{Time: newBucket + 1, Tags: [][2]string{{"host", "wal-only"}}, Fields: mkFields(1.0), Rank: 2},
+		},
+	}
+
+	pts2, _, _ := runExtract(t, f, tbl, math.MinInt64, math.MaxInt64, nil)
+	if len(pts2) != len(pts)+1 {
+		t.Fatalf("with extras got %d points, want %d (one overwrite + one new)", len(pts2), len(pts)+1)
+	}
+	var sawWinner, sawWALOnly bool
+	for _, p := range pts2 {
+		if p.UnixNano == victim.UnixNano && reflect.DeepEqual(p.Tags, victim.Tags) {
+			if len(p.Fields) != 1 || p.Fields[0].Value.Float != 222.5 {
+				t.Fatalf("WAL overwrite lost: fields = %+v", p.Fields)
+			}
+			sawWinner = true
+		}
+		if p.UnixNano == newBucket+1 {
+			if len(p.Tags) != 1 || p.Tags[0][1] != "wal-only" {
+				t.Fatalf("WAL-only row malformed: %+v", p.Tags)
+			}
+			sawWALOnly = true
+		}
+	}
+	if !sawWinner || !sawWALOnly {
+		t.Fatalf("winner=%v walOnly=%v, want both", sawWinner, sawWALOnly)
+	}
+
+	// Determinism with extras: two runs, byte-identical.
+	_, out1, _ := runExtract(t, f, tbl, math.MinInt64, math.MaxInt64, nil)
+	_, out2, _ := runExtract(t, f, tbl, math.MinInt64, math.MaxInt64, nil)
+	if out1 != out2 {
+		t.Fatal("extraction with extras is not deterministic")
+	}
+}
+
+func TestExtraRowUnknownTagRefused(t *testing.T) {
+	f, tbl := cpuTable(t)
+	tbl.Extra = map[int64][]MemRow{0: {{Time: 1, Tags: [][2]string{{"rogue", "x"}},
+		Fields: []lp.Field{{Name: "usage", Value: tsm.Value{Type: tsm.BlockFloat, Float: 1}}}}}}
+	_, err := Extract(f, tbl, math.MinInt64, math.MaxInt64, nil, Options{}, func(extract.Point) {})
+	if err == nil || !strings.Contains(err.Error(), "series key incomplete") {
+		t.Fatalf("err = %v, want series-key-incomplete refusal", err)
 	}
 }

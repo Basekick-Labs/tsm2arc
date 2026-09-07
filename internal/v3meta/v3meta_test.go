@@ -85,6 +85,19 @@ func assertCatalogShape(t *testing.T, c *Catalog) {
 	if got := mem.SeriesKey; !reflect.DeepEqual(got, []string{"host"}) {
 		t.Fatalf("mem series key = %v, want [host]", got)
 	}
+	// The column-id map is what WAL decoding keys on: both fixture eras
+	// assigned cpu's ids in write order (host=0, region=1, usage=2, load=3,
+	// time=4).
+	wantCols := map[uint32]CatColumn{
+		0: {Name: "host", Kind: ColTag},
+		1: {Name: "region", Kind: ColTag},
+		2: {Name: "usage", Kind: ColField},
+		3: {Name: "load", Kind: ColField},
+		4: {Name: "time", Kind: ColTime},
+	}
+	if !reflect.DeepEqual(cpu.Columns, wantCols) {
+		t.Fatalf("cpu columns = %v, want %v", cpu.Columns, wantCols)
+	}
 	if len(c.UnknownOps) != 0 {
 		t.Fatalf("unknown ops skipped during replay: %v", c.UnknownOps)
 	}
