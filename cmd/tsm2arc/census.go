@@ -38,6 +38,23 @@ func censusMeasurements(cfg runConfig, cp *checkpoint.Store, jobs []shardJob) er
 	if cfg.resolver.Policy() != measure.PolicyFail {
 		return nil // skip/map cannot abort mid-run; no census needed
 	}
+	if cfg.v3 != nil {
+		// v3: every point of a table carries the table name as its
+		// measurement, and the names are already resolved — the census is a
+		// direct check of each live table's name, no index reads at all.
+		var bad []string
+		for _, j := range jobs {
+			name := cfg.v3.tables[j.shard.SourceID+"/"+j.shard.ShardID].Measurement
+			if res := cfg.resolver.Resolve(name); res.Action == measure.ActionInvalid {
+				bad = append(bad, name)
+			}
+		}
+		if len(bad) > 0 {
+			sort.Strings(bad)
+			return censusFailure(bad, nil)
+		}
+		return nil
+	}
 	fmt.Printf("pre-flight: checking measurement names across %d shard(s) (index-only)\n", len(jobs))
 
 	var mu sync.Mutex
@@ -123,9 +140,19 @@ func censusMeasurements(cfg runConfig, cp *checkpoint.Store, jobs []shardJob) er
 		return nil
 	}
 	sort.Strings(bad)
+	return censusFailure(bad, names)
+}
+
+// censusFailure formats the abort for invalid measurement names under the
+// fail policy, listing every offender and all three remedies at once.
+func censusFailure(bad []string, counts map[string]int) error {
 	var list strings.Builder
 	for _, m := range bad {
-		fmt.Fprintf(&list, "  %q (in %d shard(s))\n", m, names[m])
+		if counts != nil {
+			fmt.Fprintf(&list, "  %q (in %d shard(s))\n", m, counts[m])
+		} else {
+			fmt.Fprintf(&list, "  %q\n", m)
+		}
 	}
 	return fmt.Errorf("pre-flight census: %d measurement name(s) violate Arc's rule (%s) — NOTHING was sent:\n%s"+
 		"Fix them all at once:\n"+
