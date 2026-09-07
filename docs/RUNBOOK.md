@@ -1,9 +1,10 @@
 # tsm2arc Migration Runbook
 
-Operator guide for migrating InfluxDB **1.x (1.7/1.8) and 2.x (2.0–2.7)** data
-into Arc with `tsm2arc`. This covers the common case: **terabytes of InfluxDB
-data on a cold/unmounted volume** (e.g. an EBS snapshot) that is not served by
-any running `influxd`.
+Operator guide for migrating InfluxDB **1.x (1.7/1.8), 2.x (2.0–2.7), and 3.x
+(3.0–3.11, Parquet engine)** data into Arc with `tsm2arc`. This covers the
+common case: **terabytes of InfluxDB data on a cold/unmounted volume** (e.g.
+an EBS snapshot) or, for InfluxDB 3, an object store read in place — with no
+running `influxd`/`influxdb3` required.
 
 > Read [DESIGN.md](DESIGN.md) for *why* the tool works the way it does. This
 > runbook is the *how*.
@@ -68,6 +69,10 @@ to names (so Arc databases are named like the buckets), skipping the
 > however, write any *remaining* buckets under their hex IDs — so for consistent
 > Arc database names, keep the bolt available for the whole migration.)
 
+**InfluxDB 3** sources have their own layout and rules — see
+[§1b](#1b-influxdb-3-sources-corenterprise) below; the rest of this runbook
+(dry run, sizing, running, resume, verify) applies to them unchanged.
+
 Confirm what you have:
 
 ```bash
@@ -85,6 +90,86 @@ find /mnt/influx/wal/<db> -name '*.wal' -size +0c
 > shutdown. A cold volume routinely has recent or small shards living *only* in
 > `.wal` files. If you omit `--waldir`, that data is silently skipped. **Always
 > pass `--waldir`.**
+
+---
+
+## 1b. InfluxDB 3 sources (Core/Enterprise)
+
+InfluxDB 3 has no TSM: everything — parquet data files, WAL, snapshot
+manifests, the catalog — lives in an **object store** (a local directory with
+`--object-store file`, or S3). tsm2arc reads that store directly, on disk or
+**in place on S3**:
+
+```bash
+# local directory (the store root: the directory holding the node prefix)
+tsm2arc --datadir /mnt/influxdb3-store --dry-run
+
+# straight from S3 — listings and range reads, no scratch-volume sync.
+# Credentials come from the standard AWS chain (env vars, shared config,
+# IMDS/IRSA); --s3-endpoint for MinIO/on-prem gateways.
+tsm2arc --datadir s3://my-bucket/influxdb3 --dry-run
+```
+
+The layout is auto-detected and **no v3-specific flags are needed**: database
+and table names, series keys, and column types come from the store's catalog —
+all catalog formats are read natively, including the binary format of
+3.10+/3.11. Each live table migrates as one unit (the "shard" of the progress
+output), and everything else in this runbook — dry run, `--workers`,
+`--inflight`, resume, measurement policies, verification — works exactly as
+for 1.x/2.x.
+
+**The WAL is read natively — nothing is left behind.** InfluxDB 3 keeps up to
+~10 minutes of the newest writes only in its WAL, and a clean server shutdown
+does **not** flush them (v3 never snapshots on shutdown — a cold store almost
+always carries un-snapshotted WAL). tsm2arc decodes those WAL files in-process
+and merges the rows into the migration, printing what it recovered:
+
+```
+decoded 40 row(s) from 4 un-snapshotted WAL file(s) (sequences 13-16); nothing left behind
+```
+
+`--skip-wal` skips the decode explicitly (the skipped span is printed, and
+those newest writes will be missing from Arc — only use it when you know the
+WAL content is disposable).
+
+**Duplicates resolve last-write-wins**, deterministically, matching the
+overwrite semantics InfluxDB 3 itself applies at query time. Emission order is
+a pure function of the store, so resume is byte-exact; the live file set is
+part of the checkpoint fingerprint, and a store that changed under a
+checkpoint fails up front as "different settings" rather than corrupting the
+migration.
+
+### Enterprise stores
+
+Enterprise clusters put the catalog under the **cluster prefix** (next to the
+node prefix); tsm2arc finds it automatically. What matters is the
+**compactor**:
+
+- **Compactor never ran** (nodes run `--mode ingest,query`, or you migrated
+  before it started): fully supported, identical to Core.
+- **Compactor has run** (`cs/`, `cd/`, or `c/` exist under the node prefix):
+  compaction rewrites data behind a proprietary index and deletes the original
+  gen1 parquet shortly after (`compaction-cleanup-wait`, ~10 minutes), so a
+  migration could silently miss whatever was compacted. tsm2arc **refuses**
+  and prints the supported recipes: run the ingest/query nodes without compact
+  mode and migrate that store; migrate a copy taken before compaction; or
+  export from the running server (`influxdb3 query --format parquet`).
+- **Pacha-tree engine** (`.pt` files — the default for NEW Enterprise 3.11+
+  clusters): proprietary and out of scope. tsm2arc detects it and explains the
+  two escape hatches: clusters *upgraded* from the Parquet engine retain their
+  pre-upgrade parquet until `influxdb3 cleanup-parquet` is run — migrate that
+  data **before** cleanup; otherwise export via query from the running server.
+
+Multi-node (clustered) stores are not supported yet; single-node stores of any
+tier work as above.
+
+### v3 verification oracle
+
+For v3 you get a **third** independent count for §7: the snapshot manifests
+record per-file row counts, and `--analyze` prints the reconciled totals per
+table (plus bucket/overlap stats and WAL status). If the source server can be
+run, its own `SELECT count(*)` (which replays its WAL) is the gold oracle —
+tsm2arc's extracted counts must match it exactly.
 
 ---
 
@@ -525,6 +610,11 @@ will skip everything already done and add only the WAL-resident data).
 | `checkpoint was created with different settings` | resuming with a changed `--chunk-bytes`/`--start`/`--end`/`--db-map`/`--precision`/`--measurement-map`/`--on-invalid-measurement` | restore the original flags, or use a fresh `--checkpoint` (full re-migration) |
 | Run aborts on a corrupt TSM file | damaged source file | note the file from the error; consider `--database-filter`/`--start`/`--end` to skip the affected shard's range, then handle it separately |
 | Resume re-sends everything | wrong/missing `--checkpoint` path | always point `--checkpoint` at the same durable file |
+| (v3) `…COMPACTOR has run…` refusal | Enterprise compactor state (`cs/`/`cd/`/`c/`) in the store | use a store from nodes running `--mode ingest,query`, a pre-compaction copy, or query-export — see §1b |
+| (v3) `…Pacha-tree storage engine…` | Enterprise 3.11+ new-cluster store (`.pt` format) | migrate the retained parquet before `cleanup-parquet`, or query-export — see §1b |
+| (v3) `…WAL file(s) hold writes not yet persisted…` | store from a fresh 3.10+/3.11 server whose binary catalog predates the data (rare) | run the server until a newer snapshot appears, or accept the gap with `--skip-wal` |
+| (v3) `cannot resolve names for N live table(s)` | catalog unreadable/incomplete | supply `--v3-db`/`--v3-table` overrides (tags in first-write order) |
+| (v3) `checkpoint was created with different settings` on an unchanged command | the store changed between run and resume (new snapshot/WAL) — the live set is fingerprinted | migrate from a quiesced/frozen store; a fresh `--checkpoint` restarts against the new state |
 
 ---
 
@@ -550,4 +640,13 @@ tsm2arc \
   --dry-run             extract + count, do not write to Arc
   --sample N            print N sample LP lines/DB in dry-run
   --verbose             per-shard/chunk logging
+
+InfluxDB 3 sources (auto-detected; --datadir may be a local store root or s3://bucket/prefix):
+  --s3-endpoint URL     custom S3 endpoint (MinIO/on-prem); forces path-style
+  --s3-region REGION    override the AWS region from the credential chain
+  --skip-wal            skip decoding un-snapshotted WAL (those newest writes
+                        will be MISSING from Arc; normally not needed)
+  --v3-db id=name                     override a database id's name (rarely needed)
+  --v3-table db/table=name:tag1,tag2  override a table's name + series key
+                                      (tags in FIRST-WRITE order; rarely needed)
 ```

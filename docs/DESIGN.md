@@ -303,3 +303,52 @@ The tool was built in phases, all shipped:
 2. **Mapping = InfluxDB database → Arc database (namespace), passthrough.** Arc databases and measurements are just namespaces/folders — writing to a database name creates it. So: **source InfluxDB database name → Arc `db` parameter** (per request via `x-arc-database`), and **source measurement name → Arc measurement** unchanged. There is NO single global `--db`. The tool iterates source databases discovered under `<datadir>/data/<db>/...` and routes each shard's chunks to the matching Arc database. `--db-map old=new` is an optional override for renaming; default is identity.
 3. **Time ordering = respect data time exactly.** Arc partitions by the **data timestamp** (`{db}/{measurement}/{year}/{month}/{day}/{hour}/`), identical to live ingestion. A pre-epoch point (e.g. 1959-12-16T00:00:00Z) lands in the matching pre-1970 partition. The tool does nothing special — it emits LP with the original nanosecond timestamp and Arc's normal ingest path files it by data time. `--start/--end` remain as optional *filters* (skip out-of-range points), NOT as a partitioning mechanism. Pre-epoch (negative-nanosecond) timestamps are supported end to end.
 4. **Sample data = self-host.** Validation runs against self-hosted InfluxDB 1.8 and 2.7 containers (`fixture/`) with known seeded data, so extraction is asserted value-by-value against what was written — stronger than a blind customer-file round-trip.
+
+---
+
+## Appendix: InfluxDB 3 sources (added 2026-09-07)
+
+InfluxDB 3 (3.0–3.11) has no TSM: parquet data files, a bitcode-encoded WAL,
+JSON snapshot manifests, and the catalog all live in an object store. The v3
+source engine plugs into the existing pipeline at exactly one seam (the
+per-shard point iterator); chunking, the sink, checkpointing, census, audit,
+and telemetry are reused unchanged. Design decisions of record:
+
+1. **Sources are read through a VFS** (`internal/vfs`: List/ReadFile/ReaderAt)
+   with `file://` and `s3://` implementations — parquet wants range reads,
+   which is exactly the object-store access pattern, so S3 stores are read in
+   place rather than synced to scratch volumes.
+2. **The live parquet set** comes from folding snapshot manifests in sequence
+   order, overridden by per-table indexes where they exist (retention and hard
+   deletes rewrite the indexes while old manifests go stale — folding
+   manifests alone would resurrect deleted files). Observed on real stores:
+   table indexes are created lazily and are often absent; catalog checkpoints
+   lag reality, so catalog **log replay is mandatory**.
+3. **Emission order** is (gen1 bucket ascending, series ascending, time
+   ascending), where series order is the files' physical sort: series-key
+   columns in **tag insertion order, NULLS FIRST** (the catalog's order, not
+   lexicographic). The order is a pure function of the store, so resume is
+   byte-exact through the existing cursor machinery; the live set joins the
+   config fingerprint so a mutated store fails as "different settings".
+4. **Cross-file duplicates resolve last-write-wins** (newest WAL sequence,
+   then file id, then path) — deterministic, matching the server's query-time
+   overwrite semantics but stricter than its unguaranteed same-window order.
+5. **Bitcode payloads (WAL, binary catalog) are decoded by the upstream codec
+   itself**: the Rust struct graphs vendored at pinned tags, linked against
+   the same `bitcode` crate the servers use, compiled to wasm32-wasip1,
+   embedded via go:embed, and executed in-process with wazero — single static
+   Go binary, no cgo. A pure-Go bitcode port was rejected (bit-packed, wire
+   format defined by struct shape, explicitly unstable upstream). Verified:
+   the WAL graph is identical across ALL release tags 3.0.0–3.11.4, and the
+   catalog-record graph across 3.10.0–3.11.4; upstream's own round-trip hex
+   vectors are mirrored as tests so drift fails the build.
+6. **Un-snapshotted WAL is decoded and merged, not gated**: a clean v3
+   shutdown never snapshots, so every real cold store carries up to ~10
+   minutes of WAL-only writes (including whole tables). WAL rows outrank
+   parquet in LWW; `--skip-wal` is an explicit opt-out.
+7. **Enterprise tiers**: cluster-prefix catalogs are resolved automatically;
+   compactor state (`cs/`/`cd/`/`c/`) refuses the load (compacted data hides
+   behind a proprietary run-set index and gen1 gets deleted ~10 minutes after
+   compaction); Pacha-tree (`.pt`) stores are detected and explained as out of
+   scope with the documented escape hatches. All three behaviors validated
+   against real licensed Enterprise servers.
