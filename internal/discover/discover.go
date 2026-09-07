@@ -26,6 +26,8 @@ const (
 	VersionUnknown Version = iota
 	Version1
 	Version2
+	// Version3 is an InfluxDB 3 Core/Enterprise object store (Parquet engine).
+	Version3
 )
 
 func (v Version) String() string {
@@ -34,9 +36,46 @@ func (v Version) String() string {
 		return "1.x"
 	case Version2:
 		return "2.x"
+	case Version3:
+		return "3.x"
 	default:
 		return "unknown"
 	}
+}
+
+// detectV3 reports whether path is an InfluxDB 3 (Core/Enterprise) object
+// store, checked BEFORE the 1.x probe because a v3 tree would false-positive
+// it: at a v3 store root, {node_id}/dbs/{numeric db_id} parses as a plausible
+// db/rp/shard chain. A directory qualifies as a v3 node prefix when it holds
+// at least two of the persistence markers (wal/, snapshots/, dbs/, catalog/ or
+// catalogs/); the store root is either that directory itself or its parent
+// (object stores hold one or more node prefixes at the root, plus a cluster
+// prefix on Enterprise).
+func detectV3(path string) (root string, ok bool) {
+	if v3NodeMarkers(path) >= 2 {
+		return path, true
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return "", false
+	}
+	for _, e := range entries {
+		if e.IsDir() && v3NodeMarkers(filepath.Join(path, e.Name())) >= 2 {
+			return path, true
+		}
+	}
+	return "", false
+}
+
+// v3NodeMarkers counts InfluxDB 3 persistence directories under dir.
+func v3NodeMarkers(dir string) int {
+	n := 0
+	for _, m := range []string{"wal", "snapshots", "dbs", "catalog", "catalogs"} {
+		if fi, err := os.Stat(filepath.Join(dir, m)); err == nil && fi.IsDir() {
+			n++
+		}
+	}
+	return n
 }
 
 // Detect inspects a path and resolves it to the TSM data directory plus the
@@ -65,6 +104,11 @@ func Detect(path string) (dataDir string, version Version) {
 		if isEngineData(p) {
 			return p, Version2
 		}
+	}
+	// InfluxDB 3 (Parquet engine object store) — must precede the 1.x probe;
+	// see detectV3.
+	if root, ok := detectV3(path); ok {
+		return root, Version3
 	}
 	// 1.x: a data dir whose children are <db>/<rp>/<shard>. A candidate that is
 	// 1.x-SHAPED but unreadable (0700 root-owned db dirs are the norm for real
