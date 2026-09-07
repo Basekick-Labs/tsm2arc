@@ -38,6 +38,9 @@ type v3Source struct {
 	// when nothing was decoded); part of the config fingerprint because
 	// decoded WAL rows shape chunk boundaries.
 	walDecodedMax uint64
+	// compactor reports Enterprise compactor state in the store — the
+	// refuse signal for loads; --analyze reports it instead.
+	compactor bool
 }
 
 // v3Options are the operator inputs specific to v3 stores.
@@ -54,11 +57,11 @@ type v3Options struct {
 // setupV3 resolves a LOCAL InfluxDB 3 store into synthesized shards plus the
 // v3Source the extraction seam uses.
 func setupV3(root string, opt v3Options, infow io.Writer) ([]discover.Shard, *v3Source, error) {
-	root, node, err := v3NodePrefix(root)
+	root, node, cluster, err := v3NodePrefix(root)
 	if err != nil {
 		return nil, nil, err
 	}
-	return setupV3FS(vfs.NewLocal(root), node, filepath.Join(root, node), opt, infow)
+	return setupV3FS(vfs.NewLocal(root), node, cluster, filepath.Join(root, node), opt, infow)
 }
 
 // setupV3S3 is setupV3 for an s3://bucket[/prefix] store, reading it in
@@ -68,25 +71,27 @@ func setupV3S3(ctx context.Context, rawURL string, s3opt vfs.S3Options, opt v3Op
 	if err != nil {
 		return nil, nil, err
 	}
-	node, f, err := v3NodeOnS3(f)
+	node, cluster, f, err := v3NodeOnS3(f)
 	if err != nil {
 		return nil, nil, err
 	}
-	return setupV3FS(f, node, f.URL()+"/"+node, opt, infow)
+	return setupV3FS(f, node, cluster, f.URL()+"/"+node, opt, infow)
 }
 
 // v3NodeOnS3 locates the single node prefix in an S3 store, normalizing a
 // URL that points AT the node prefix back to the store root (manifest paths
 // are node-prefixed, so the FS root must be the node's parent).
-func v3NodeOnS3(f *vfs.S3) (string, *vfs.S3, error) {
+func v3NodeOnS3(f *vfs.S3) (string, string, *vfs.S3, error) {
+	sub := func(prefix, m string) string {
+		if prefix == "" {
+			return m
+		}
+		return prefix + "/" + m
+	}
 	markers := func(fs *vfs.S3, prefix string) int {
 		n := 0
 		for _, m := range []string{"wal", "snapshots", "dbs", "catalog", "catalogs"} {
-			p := m
-			if prefix != "" {
-				p = prefix + "/" + m
-			}
-			if vfs.HasPrefix(fs, p) {
+			if vfs.HasPrefix(fs, sub(prefix, m)) {
 				n++
 			}
 		}
@@ -97,7 +102,7 @@ func v3NodeOnS3(f *vfs.S3) (string, *vfs.S3, error) {
 		pfx := f.Prefix()
 		i := strings.LastIndexByte(pfx, '/')
 		if pfx == "" {
-			return "", nil, fmt.Errorf("%s holds the node's contents at the bucket root, but InfluxDB 3 object paths are node-prefixed (node_id/dbs/...); sync or point at the parent so the node prefix is preserved", f.URL())
+			return "", "", nil, fmt.Errorf("%s holds the node's contents at the bucket root, but InfluxDB 3 object paths are node-prefixed (node_id/dbs/...); sync or point at the parent so the node prefix is preserved", f.URL())
 		}
 		var parent, node string
 		if i < 0 {
@@ -105,32 +110,68 @@ func v3NodeOnS3(f *vfs.S3) (string, *vfs.S3, error) {
 		} else {
 			parent, node = pfx[:i], pfx[i+1:]
 		}
-		return node, vfs.NewS3Rebased(f, parent), nil
+		return node, "", vfs.NewS3Rebased(f, parent), nil
 	}
 	children, err := f.ListDir("")
 	if err != nil {
-		return "", nil, err
+		return "", "", nil, err
 	}
 	var nodes []string
+	var cluster string
+	pacha := false
 	for _, c := range children {
-		if markers(f, c) >= 2 {
+		switch {
+		case markers(f, c) >= 2:
 			nodes = append(nodes, c)
+		case vfs.HasPrefix(f, c+"/cv2") || vfs.HasPrefix(f, c+"/pt_snapshots"):
+			pacha = true
+		case vfs.HasPrefix(f, c+"/catalog") || vfs.HasPrefix(f, c+"/catalogs"):
+			cluster = c
 		}
 	}
 	switch len(nodes) {
 	case 1:
-		return nodes[0], f, nil
+		return nodes[0], cluster, f, nil
 	case 0:
-		return "", nil, fmt.Errorf("no InfluxDB 3 node prefix found under %s", f.URL())
+		if pacha {
+			return "", "", nil, fmt.Errorf(
+				"the store under %s uses the Pacha-tree storage engine (Enterprise 3.11+ .pt format), which is proprietary and cannot be read by this tool.\n"+
+					"  Options:\n"+
+					"    a) clusters UPGRADED from the Parquet engine retain their pre-upgrade parquet until 'influxdb3 cleanup-parquet' is run - point --datadir at that data BEFORE cleanup;\n"+
+					"    b) export from the running server (influxdb3 query --format parquet preserves all type metadata and arrives deduplicated) - an export-ingestion mode is tracked in https://github.com/Basekick-Labs/tsm2arc/issues/10.",
+				f.URL())
+		}
+		return "", "", nil, fmt.Errorf("no InfluxDB 3 node prefix found under %s", f.URL())
 	default:
-		return "", nil, fmt.Errorf("store has %d node prefixes (%s): multi-node stores are not supported yet (https://github.com/Basekick-Labs/tsm2arc/issues/10)", len(nodes), strings.Join(nodes, ", "))
+		return "", "", nil, fmt.Errorf("store has %d node prefixes (%s): multi-node stores are not supported yet (https://github.com/Basekick-Labs/tsm2arc/issues/10)", len(nodes), strings.Join(nodes, ", "))
 	}
 }
 
 // setupV3FS is the FS-agnostic body shared by the local and S3 paths. label
-// names the store in messages. Fatal errors here are pre-flight: nothing has
-// been sent yet.
-func setupV3FS(f vfs.FS, node, label string, opt v3Options, infow io.Writer) ([]discover.Shard, *v3Source, error) {
+// names the store in messages; cluster is the Enterprise cluster prefix when
+// one sits next to the node prefix ("" otherwise). Fatal errors here are
+// pre-flight: nothing has been sent yet.
+func setupV3FS(f vfs.FS, node, cluster, label string, opt v3Options, infow io.Writer) ([]discover.Shard, *v3Source, error) {
+	// Enterprise compactor state (cs/, cd/, c/ under the node) means the
+	// compactor has run: gen1 parquet gets superseded and DELETED
+	// (compaction-cleanup-wait, ~10 minutes), and the replacement data is
+	// referenced only by the proprietary run-set index this tool cannot
+	// read. Migrating around that is silent data loss, so the load refuses;
+	// --analyze reports instead.
+	compactor := vfs.HasPrefix(f, node+"/c") || vfs.HasPrefix(f, node+"/cs") || vfs.HasPrefix(f, node+"/cd")
+	if compactor && !opt.analyze {
+		return nil, nil, fmt.Errorf(
+			"this is an InfluxDB 3 Enterprise store whose COMPACTOR has run (compactor state exists under %s/cs|cd|c).\n"+
+				"  Compaction rewrites data into a proprietary format and deletes the original gen1 parquet shortly after;\n"+
+				"  a migration from this store could silently miss whatever was already compacted.\n"+
+				"  Supported recipes:\n"+
+				"    a) run the ingest/query nodes WITHOUT compact mode (--mode ingest,query) and migrate that store;\n"+
+				"    b) migrate a copy taken BEFORE the compactor first ran;\n"+
+				"    c) export from the running server (influxdb3 query --format parquet).\n"+
+				"  Details: https://github.com/Basekick-Labs/tsm2arc/issues/10.",
+			node)
+	}
+
 	snaps, err := v3meta.LoadSnapshots(f, node)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read snapshot manifests: %w", err)
@@ -146,10 +187,13 @@ func setupV3FS(f vfs.FS, node, label string, opt v3Options, infow io.Writer) ([]
 		return nil, nil, err
 	}
 
-	// Names: catalog first, operator flags on top. A binary (3.10+) catalog
-	// with no preserved JSON fallback is fine as long as the flags cover
-	// every live table.
+	// Names: catalog first, operator flags on top. On Enterprise stores the
+	// catalog lives under the CLUSTER prefix, not the node prefix — try the
+	// node first (Core layout), then the cluster.
 	cat, catErr := v3meta.LoadCatalog(f, node)
+	if errors.Is(catErr, v3meta.ErrNoCatalog) && cluster != "" {
+		cat, catErr = v3meta.LoadCatalog(f, cluster)
+	}
 	if catErr != nil && !errors.Is(catErr, v3meta.ErrBinaryCatalog) {
 		return nil, nil, catErr
 	}
@@ -219,7 +263,7 @@ func setupV3FS(f vfs.FS, node, label string, opt v3Options, infow io.Writer) ([]
 			danglingCount(rec), strings.Join(parts, ", "))
 	}
 
-	src := &v3Source{fs: f, node: node, tables: map[string]extract3.Table{}, live: live, wal: wal, catalog: cat, skipWAL: opt.skipWAL, snapshots: len(snaps), walDecodedMax: walDecodedMax}
+	src := &v3Source{fs: f, node: node, tables: map[string]extract3.Table{}, live: live, wal: wal, catalog: cat, skipWAL: opt.skipWAL, snapshots: len(snaps), walDecodedMax: walDecodedMax, compactor: compactor}
 	var shards []discover.Shard
 	var unresolved []string
 	// Iterate the union of live-set tables and WAL-only tables: a table whose
@@ -301,11 +345,15 @@ func sortableTableID(s string) string { return fmt.Sprintf("%020s", s) }
 // when --datadir points directly at the node directory, the effective root is
 // its parent. Multi-node (Enterprise cluster) stores are refused for now:
 // their tables span nodes and merging them correctly is future work.
-func v3NodePrefix(root string) (normRoot, node string, err error) {
+func v3NodePrefix(root string) (normRoot, node, cluster string, err error) {
+	has := func(parts ...string) bool {
+		fi, err := os.Stat(filepath.Join(parts...))
+		return err == nil && fi.IsDir()
+	}
 	markers := func(dir string) int {
 		n := 0
 		for _, m := range []string{"wal", "snapshots", "dbs", "catalog", "catalogs"} {
-			if fi, err := os.Stat(filepath.Join(dir, m)); err == nil && fi.IsDir() {
+			if has(dir, m) {
 				n++
 			}
 		}
@@ -314,28 +362,49 @@ func v3NodePrefix(root string) (normRoot, node string, err error) {
 	if markers(root) >= 2 {
 		abs, err := filepath.Abs(root)
 		if err != nil {
-			return "", "", err
+			return "", "", "", err
 		}
-		return filepath.Dir(abs), filepath.Base(abs), nil
+		return filepath.Dir(abs), filepath.Base(abs), "", nil
 	}
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	var nodes []string
+	pacha := false
 	for _, e := range entries {
-		if e.IsDir() && markers(filepath.Join(root, e.Name())) >= 2 {
+		if !e.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, e.Name())
+		switch {
+		case markers(dir) >= 2:
 			nodes = append(nodes, e.Name())
+		case has(dir, "cv2") || has(dir, "pt_snapshots"):
+			// Pacha-tree engine artifacts (Enterprise 3.11+ new clusters).
+			pacha = true
+		case has(dir, "catalog") || has(dir, "catalogs"):
+			// Enterprise CLUSTER prefix: the catalog (and license/config)
+			// live here, next to the node prefixes.
+			cluster = e.Name()
 		}
 	}
 	switch len(nodes) {
 	case 1:
-		return root, nodes[0], nil
+		return root, nodes[0], cluster, nil
 	case 0:
-		return "", "", fmt.Errorf("no InfluxDB 3 node prefix found under %s", root)
+		if pacha {
+			return "", "", "", fmt.Errorf(
+				"the store under %s uses the Pacha-tree storage engine (Enterprise 3.11+ .pt format), which is proprietary and cannot be read by this tool.\n"+
+					"  Options:\n"+
+					"    a) clusters UPGRADED from the Parquet engine retain their pre-upgrade parquet until 'influxdb3 cleanup-parquet' is run - point --datadir at that data BEFORE cleanup;\n"+
+					"    b) export from the running server (influxdb3 query --format parquet preserves all type metadata and arrives deduplicated) - an export-ingestion mode is tracked in https://github.com/Basekick-Labs/tsm2arc/issues/10.",
+				root)
+		}
+		return "", "", "", fmt.Errorf("no InfluxDB 3 node prefix found under %s", root)
 	default:
 		sort.Strings(nodes)
-		return "", "", fmt.Errorf("store has %d node prefixes (%s): multi-node stores are not supported yet (https://github.com/Basekick-Labs/tsm2arc/issues/10)", len(nodes), strings.Join(nodes, ", "))
+		return "", "", "", fmt.Errorf("store has %d node prefixes (%s): multi-node stores are not supported yet (https://github.com/Basekick-Labs/tsm2arc/issues/10)", len(nodes), strings.Join(nodes, ", "))
 	}
 }
 
@@ -480,6 +549,7 @@ type v3AnalyzeReport struct {
 	NewestSnapshot   uint64           `json:"newest_snapshot"`
 	WALFiles         int              `json:"wal_files"`
 	UnsnapshottedWAL int              `json:"unsnapshotted_wal_files"`
+	CompactorState   bool             `json:"enterprise_compactor_state"`
 	Tables           []v3AnalyzeTable `json:"tables"`
 }
 
@@ -494,6 +564,7 @@ func runAnalyzeV3(cfg runConfig, root string) {
 		NewestSnapshot:   src.live.NewestSnapshot,
 		WALFiles:         src.wal.Files,
 		UnsnapshottedWAL: len(src.wal.Unsnapshotted),
+		CompactorState:   src.compactor,
 	}
 	for _, sh := range cfg.shards {
 		tbl := src.tables[sh.SourceID+"/"+sh.ShardID]
@@ -542,6 +613,9 @@ func runAnalyzeV3(cfg runConfig, root string) {
 		rep.Store, rep.Snapshots, rep.NewestSnapshot, rep.WALFiles, rep.UnsnapshottedWAL)
 	if rep.UnsnapshottedWAL > 0 {
 		fmt.Printf("  NOTE: un-snapshotted WAL holds the newest writes; a load decodes it natively (or skips it with --skip-wal)\n")
+	}
+	if rep.CompactorState {
+		fmt.Printf("  WARNING: Enterprise COMPACTOR state present - compacted data is unreadable and gen1 files get deleted; a load will refuse (see the supported recipes in the refusal message)\n")
 	}
 	for _, t := range rep.Tables {
 		fmt.Printf("  %s/%s: %d file(s), %.1f MiB, %d row(s), %d bucket(s), overlap %.2f (max %d files/bucket)",

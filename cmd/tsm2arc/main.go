@@ -316,7 +316,7 @@ func main() {
 				"      next to the engine/ dir to get names and system-bucket filtering.\n", boltPath)
 		}
 	case discover.Version3:
-		fmt.Fprintf(infow, "detected InfluxDB 3 (Parquet engine) object store at %s\n", resolvedData)
+		fmt.Fprintf(infow, "detected InfluxDB 3 object store at %s\n", resolvedData)
 	case discover.Version1:
 		fmt.Fprintf(infow, "detected InfluxDB 1.x layout at %s\n", resolvedData)
 	default:
