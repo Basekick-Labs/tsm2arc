@@ -146,22 +146,34 @@ func readFile(f vfs.FS, tbl Table, pf v3meta.ParquetFile, rank int, keyPos map[s
 // 0x00 0xFF, terminated by 0x00. The terminator (0x00 at end or before the
 // next column's marker) sorts below every escaped continuation, so prefixes
 // order correctly.
+//
+// The result is lowercase-hex encoded: the cursor rides checkpoint columns
+// and log lines, where raw NUL/control bytes are hazardous, and hex is
+// order-preserving (two fixed digits per byte, '0'-'9' < 'a'-'f' in byte
+// order), so string comparison of encoded keys still equals the sort order.
 func orderKey(b *strings.Builder, vals []*string) string {
 	b.Reset()
 	for _, v := range vals {
 		if v == nil {
-			b.WriteByte(0x00)
+			hexByte(b, 0x00)
 			continue
 		}
-		b.WriteByte(0x01)
+		hexByte(b, 0x01)
 		s := *v
 		for i := 0; i < len(s); i++ {
-			b.WriteByte(s[i])
+			hexByte(b, s[i])
 			if s[i] == 0x00 {
-				b.WriteByte(0xFF)
+				hexByte(b, 0xFF)
 			}
 		}
-		b.WriteByte(0x00)
+		hexByte(b, 0x00)
 	}
 	return b.String()
+}
+
+const hexDigits = "0123456789abcdef"
+
+func hexByte(b *strings.Builder, c byte) {
+	b.WriteByte(hexDigits[c>>4])
+	b.WriteByte(hexDigits[c&0x0f])
 }
