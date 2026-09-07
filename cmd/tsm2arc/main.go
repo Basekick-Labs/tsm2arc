@@ -26,6 +26,7 @@ import (
 	"github.com/basekick-labs/tsm2arc/internal/extract"
 	"github.com/basekick-labs/tsm2arc/internal/measure"
 	"github.com/basekick-labs/tsm2arc/internal/sink"
+	"github.com/basekick-labs/tsm2arc/internal/vfs"
 )
 
 // Build metadata, injected by GoReleaser via -ldflags (-X main.version=…).
@@ -127,6 +128,8 @@ func main() {
 		onInvalid    = flag.String("on-invalid-measurement", "fail", "what to do with a measurement name Arc would reject (after --measurement-map): fail|skip|map (map = deterministic auto-rename, recorded in the checkpoint)")
 		mMapFile     = flag.String("measurement-map-file", "", "file of measurement renames, one old=new per line (#-comments and blank lines ignored)")
 		skipWAL      = flag.Bool("skip-wal", false, "InfluxDB 3 sources only: proceed even when un-snapshotted WAL exists, explicitly accepting that those newest writes will be MISSING from Arc")
+		s3Endpoint   = flag.String("s3-endpoint", "", "with --datadir s3://…: custom S3 endpoint URL (MinIO, on-prem gateways); forces path-style addressing")
+		s3Region     = flag.String("s3-region", "", "with --datadir s3://…: override the AWS region from the credential chain")
 		dbFilterArg  multiFlag
 		dbMapArg     multiFlag
 		mMapArg      multiFlag
@@ -266,8 +269,19 @@ func main() {
 
 	// Detect 1.x vs 2.x and resolve the actual TSM data dir. For 2.x we also
 	// auto-resolve the WAL dir (engine/wal) and load bucket-id → name from
-	// influxd.bolt so shards key on readable names.
-	resolvedData, ver := discover.Detect(*datadir)
+	// influxd.bolt so shards key on readable names. An s3:// datadir is an
+	// InfluxDB 3 object store by definition (1.x/2.x TSM dirs are local disk).
+	var resolvedData string
+	var ver discover.Version
+	s3Source := strings.HasPrefix(*datadir, "s3://")
+	if s3Source {
+		resolvedData, ver = *datadir, discover.Version3
+	} else {
+		if *s3Endpoint != "" || *s3Region != "" {
+			fatal("--s3-endpoint/--s3-region apply to --datadir s3://… sources only")
+		}
+		resolvedData, ver = discover.Detect(*datadir)
+	}
 	wd := *waldir
 	var bucketMap *buckets.Mapping
 	switch ver {
@@ -319,7 +333,7 @@ func main() {
 		for _, d := range dbFilterArg {
 			filter[d] = true
 		}
-		shards, v3src, err = setupV3(resolvedData, v3Options{
+		v3opt := v3Options{
 			skipWAL:  *skipWAL,
 			dbNames:  v3DBArg,
 			tables:   v3TableArg,
@@ -327,7 +341,13 @@ func main() {
 			internal: *inclInternal,
 			analyze:  *analyze,
 			dryRun:   *dryRun,
-		}, infow)
+		}
+		if s3Source {
+			shards, v3src, err = setupV3S3(context.Background(), resolvedData,
+				vfs.S3Options{Endpoint: *s3Endpoint, Region: *s3Region}, v3opt, infow)
+		} else {
+			shards, v3src, err = setupV3(resolvedData, v3opt, infow)
+		}
 		if err != nil {
 			fatal("%v", err)
 		}

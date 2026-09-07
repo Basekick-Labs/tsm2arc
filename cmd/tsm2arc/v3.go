@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -46,16 +47,86 @@ type v3Options struct {
 	dryRun   bool
 }
 
-// setupV3 resolves an InfluxDB 3 store into synthesized shards (one per live
-// table) plus the v3Source the extraction seam uses. Fatal errors here are
-// pre-flight: nothing has been sent yet.
+// setupV3 resolves a LOCAL InfluxDB 3 store into synthesized shards plus the
+// v3Source the extraction seam uses.
 func setupV3(root string, opt v3Options, infow io.Writer) ([]discover.Shard, *v3Source, error) {
 	root, node, err := v3NodePrefix(root)
 	if err != nil {
 		return nil, nil, err
 	}
-	f := vfs.NewLocal(root)
+	return setupV3FS(vfs.NewLocal(root), node, filepath.Join(root, node), opt, infow)
+}
 
+// setupV3S3 is setupV3 for an s3://bucket[/prefix] store, reading it in
+// place with listings and range GETs — no scratch-volume sync.
+func setupV3S3(ctx context.Context, rawURL string, s3opt vfs.S3Options, opt v3Options, infow io.Writer) ([]discover.Shard, *v3Source, error) {
+	f, err := vfs.NewS3(ctx, rawURL, s3opt)
+	if err != nil {
+		return nil, nil, err
+	}
+	node, f, err := v3NodeOnS3(f)
+	if err != nil {
+		return nil, nil, err
+	}
+	return setupV3FS(f, node, f.URL()+"/"+node, opt, infow)
+}
+
+// v3NodeOnS3 locates the single node prefix in an S3 store, normalizing a
+// URL that points AT the node prefix back to the store root (manifest paths
+// are node-prefixed, so the FS root must be the node's parent).
+func v3NodeOnS3(f *vfs.S3) (string, *vfs.S3, error) {
+	markers := func(fs *vfs.S3, prefix string) int {
+		n := 0
+		for _, m := range []string{"wal", "snapshots", "dbs", "catalog", "catalogs"} {
+			p := m
+			if prefix != "" {
+				p = prefix + "/" + m
+			}
+			if vfs.HasPrefix(fs, p) {
+				n++
+			}
+		}
+		return n
+	}
+	if markers(f, "") >= 2 {
+		// URL points at the node prefix itself; rebase to its parent.
+		pfx := f.Prefix()
+		i := strings.LastIndexByte(pfx, '/')
+		if pfx == "" {
+			return "", nil, fmt.Errorf("%s holds the node's contents at the bucket root, but InfluxDB 3 object paths are node-prefixed (node_id/dbs/...); sync or point at the parent so the node prefix is preserved", f.URL())
+		}
+		var parent, node string
+		if i < 0 {
+			parent, node = "", pfx
+		} else {
+			parent, node = pfx[:i], pfx[i+1:]
+		}
+		return node, vfs.NewS3Rebased(f, parent), nil
+	}
+	children, err := f.ListDir("")
+	if err != nil {
+		return "", nil, err
+	}
+	var nodes []string
+	for _, c := range children {
+		if markers(f, c) >= 2 {
+			nodes = append(nodes, c)
+		}
+	}
+	switch len(nodes) {
+	case 1:
+		return nodes[0], f, nil
+	case 0:
+		return "", nil, fmt.Errorf("no InfluxDB 3 node prefix found under %s", f.URL())
+	default:
+		return "", nil, fmt.Errorf("store has %d node prefixes (%s): multi-node stores are not supported yet (https://github.com/Basekick-Labs/tsm2arc/issues/10)", len(nodes), strings.Join(nodes, ", "))
+	}
+}
+
+// setupV3FS is the FS-agnostic body shared by the local and S3 paths. label
+// names the store in messages. Fatal errors here are pre-flight: nothing has
+// been sent yet.
+func setupV3FS(f vfs.FS, node, label string, opt v3Options, infow io.Writer) ([]discover.Shard, *v3Source, error) {
 	snaps, err := v3meta.LoadSnapshots(f, node)
 	if err != nil {
 		return nil, nil, fmt.Errorf("read snapshot manifests: %w", err)
@@ -149,7 +220,7 @@ func setupV3(root string, opt v3Options, infow io.Writer) ([]discover.Shard, *v3
 			Database:  dbName,
 			Retention: "gen1",
 			ShardID:   strconv.FormatUint(uint64(k.TableID), 10),
-			Dir:       filepath.Join(root, node),
+			Dir:       label,
 		}
 		src.tables[sh.SourceID+"/"+sh.ShardID] = extract3.Table{
 			Key:         k,
