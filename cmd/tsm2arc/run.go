@@ -820,6 +820,9 @@ func (c *indexCache) report(shardLabel string, prog *progress, verbose bool) {
 // itself). A hard decode error aborts via the returned error; truncated WAL
 // tails are tolerated inside the WAL reader.
 func forEachPoint(cfg runConfig, sh discover.Shard, cur *extract.Cursor, onPoint func(extract.Point), onShardStats func(extract.Stats), prog *progress) error {
+	if cfg.v3 != nil {
+		return cfg.v3.forEachPoint(cfg, sh, cur, onPoint, onShardStats, prog)
+	}
 	if prog != nil {
 		prog.logf("shard %s/%s/%s: %d tsm + %d wal file(s)",
 			sh.Database, sh.Retention, sh.ShardID, len(sh.TSMFiles), len(sh.WALFiles))

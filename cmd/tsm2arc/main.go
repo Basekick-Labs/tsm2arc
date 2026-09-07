@@ -126,9 +126,12 @@ func main() {
 		showVersion  = flag.Bool("version", false, "print version and exit")
 		onInvalid    = flag.String("on-invalid-measurement", "fail", "what to do with a measurement name Arc would reject (after --measurement-map): fail|skip|map (map = deterministic auto-rename, recorded in the checkpoint)")
 		mMapFile     = flag.String("measurement-map-file", "", "file of measurement renames, one old=new per line (#-comments and blank lines ignored)")
+		skipWAL      = flag.Bool("skip-wal", false, "InfluxDB 3 sources only: proceed even when un-snapshotted WAL exists, explicitly accepting that those newest writes will be MISSING from Arc")
 		dbFilterArg  multiFlag
 		dbMapArg     multiFlag
 		mMapArg      multiFlag
+		v3DBArg      multiFlag
+		v3TableArg   multiFlag
 	)
 	// chunk-bytes accepts a byte count or a size suffix (e.g. 450MB); default is
 	// DefaultMaxBytes (450 MiB).
@@ -141,6 +144,8 @@ func main() {
 	flag.Var(&dbFilterArg, "database-filter", "only migrate this source database/bucket (repeatable)")
 	flag.Var(&dbMapArg, "db-map", "rename source DB/bucket to Arc DB, form old=new (repeatable)")
 	flag.Var(&mMapArg, "measurement-map", "rename a source measurement, form old=new; new must satisfy Arc's name rule (repeatable)")
+	flag.Var(&v3DBArg, "v3-db", "InfluxDB 3 sources: name a database id, form db_id=name (repeatable; overrides/supplements the catalog, required per id when the catalog is the unreadable binary 3.10+ format)")
+	flag.Var(&v3TableArg, "v3-table", "InfluxDB 3 sources: name a table and its series key, form db_id/table_id=name:tag1,tag2,... with tags in FIRST-WRITE order (repeatable; ':' with no tags for a tagless table)")
 	flag.Parse()
 
 	if *showVersion {
@@ -297,28 +302,54 @@ func main() {
 				"      next to the engine/ dir to get names and system-bucket filtering.\n", boltPath)
 		}
 	case discover.Version3:
-		fatal("detected an InfluxDB 3 (Core/Enterprise) object store at %s.\n"+
-			"  InfluxDB 3 Parquet-engine sources are under active development for this tool\n"+
-			"  (see https://github.com/Basekick-Labs/tsm2arc/issues/10); this build reads\n"+
-			"  InfluxDB 1.x and 2.x TSM data directories only.", resolvedData)
+		fmt.Fprintf(infow, "detected InfluxDB 3 (Parquet engine) object store at %s\n", resolvedData)
 	case discover.Version1:
 		fmt.Fprintf(infow, "detected InfluxDB 1.x layout at %s\n", resolvedData)
 	default:
 		fmt.Fprintf(infow, "WARN: could not detect InfluxDB layout at %s; treating as a 1.x data dir\n", *datadir)
 	}
 
-	// For 1.x, filter by db name in discovery; for 2.x, discovery keys on bucket
-	// IDs, so we filter AFTER resolving names below (pass an empty filter here).
-	walkFilter := map[string]bool{}
-	if ver != discover.Version2 {
+	// InfluxDB 3 stores take a different discovery path entirely: live tables
+	// come from snapshot manifests/table indexes, names from the catalog (or
+	// --v3-db/--v3-table), and each table becomes one synthesized "shard".
+	var shards []discover.Shard
+	var v3src *v3Source
+	if ver == discover.Version3 {
+		filter := map[string]bool{}
 		for _, d := range dbFilterArg {
-			walkFilter[d] = true
+			filter[d] = true
 		}
-	}
-
-	shards, err := discover.Walk(resolvedData, wd, walkFilter, *inclInternal)
-	if err != nil {
-		fatal("discovery failed: %v", err)
+		shards, v3src, err = setupV3(resolvedData, v3Options{
+			skipWAL:  *skipWAL,
+			dbNames:  v3DBArg,
+			tables:   v3TableArg,
+			dbFilter: filter,
+			internal: *inclInternal,
+			analyze:  *analyze,
+			dryRun:   *dryRun,
+		}, infow)
+		if err != nil {
+			fatal("%v", err)
+		}
+	} else {
+		if *skipWAL {
+			fatal("--skip-wal applies to InfluxDB 3 sources only (1.x/2.x WAL is always read)")
+		}
+		if len(v3DBArg) > 0 || len(v3TableArg) > 0 {
+			fatal("--v3-db/--v3-table apply to InfluxDB 3 sources only")
+		}
+		// For 1.x, filter by db name in discovery; for 2.x, discovery keys on
+		// bucket IDs, so we filter AFTER resolving names below (empty filter here).
+		walkFilter := map[string]bool{}
+		if ver != discover.Version2 {
+			for _, d := range dbFilterArg {
+				walkFilter[d] = true
+			}
+		}
+		shards, err = discover.Walk(resolvedData, wd, walkFilter, *inclInternal)
+		if err != nil {
+			fatal("discovery failed: %v", err)
+		}
 	}
 
 	// 2.x: resolve bucket IDs → names on each shard, drop system buckets, and
@@ -350,11 +381,14 @@ func main() {
 	}
 
 	if len(shards) == 0 {
+		if ver == discover.Version3 {
+			fatal("no live tables found in the InfluxDB 3 store under %s (after filters)", *datadir)
+		}
 		fatal("no shards with TSM/WAL data found under %s", *datadir)
 	}
 
 	fmt.Fprintf(infow, "discovered %d shard(s) [%s]\n", len(shards), ver)
-	if wd == "" {
+	if wd == "" && ver != discover.Version3 {
 		fmt.Fprintln(infow, "NOTE: no WAL dir; uncompacted WAL data (if any) will not be read")
 	}
 
@@ -376,9 +410,14 @@ func main() {
 		analyzeRuns: *analyzeRuns,
 		jsonOut:     *formatFlag == "json",
 		stallWarn:   effStallWarn,
+		v3:          v3src,
 	}
 
 	if *analyze {
+		if cfg.v3 != nil {
+			runAnalyzeV3(cfg, *datadir)
+			return
+		}
 		runAnalyze(cfg)
 		return
 	}
@@ -424,6 +463,13 @@ func configFingerprint(cfg runConfig, precision string) string {
 	if mfp := cfg.resolver.Fingerprint(); mfp != "" {
 		fp += ";" + mfp
 	}
+	// v3: the live file set shapes chunk boundaries the way the TSM file set
+	// does for 1.x/2.x, so a store that changed between a run and its resume
+	// fails here as "config changed" instead of misaligning sequences or
+	// surfacing as a cryptic missing-cursor error mid-run.
+	if cfg.v3 != nil {
+		fp += ";v3liveset=" + cfg.v3.fingerprint()
+	}
 	return fp
 }
 
@@ -445,6 +491,7 @@ type runConfig struct {
 	analyzeRuns int  // --analyze text output: top-N runs per shard (0 = all)
 	jsonOut     bool // --analyze: emit the report as JSON on a pure stdout
 	stallWarn   time.Duration
+	v3          *v3Source // non-nil for InfluxDB 3 sources: replaces TSM extraction in forEachPoint
 }
 
 func (c runConfig) arcDB(sourceDB string) string {

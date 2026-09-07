@@ -7,7 +7,9 @@
 
 Migrate **InfluxDB 1.x (1.7/1.8) and 2.x (2.0–2.7)** data into
 [Arc](https://github.com/basekick-labs/arc) by reading TSM **and WAL** files
-**directly off disk** — no running `influxd` required.
+**directly off disk** — no running `influxd` required. **InfluxDB 3**
+(Parquet engine) sources are supported experimentally — see
+[InfluxDB 3 sources](#influxdb-3-coreenterprise-sources--experimental).
 
 The on-disk TSM/WAL format is the same across 1.x and 2.x; tsm2arc auto-detects
 the layout. For 2.x it resolves bucket IDs to readable names from `influxd.bolt`
@@ -54,6 +56,7 @@ multi-arch (linux amd64/arm64) on GHCR.
 | Parallel workers (`--workers`) + live progress reporting | ✅ |
 | InfluxDB **2.x** layout auto-detection + bucket-name resolution | ✅ |
 | Measurement rename map + invalid-name policy (`fail`/`skip`/`map`) with a checkpoint audit trail | ✅ |
+| InfluxDB **3.x** Parquet-engine object stores (local disk) — see [InfluxDB 3 sources](#influxdb-3-coreenterprise-sources--experimental) | 🧪 experimental |
 
 The TSM/WAL codecs (timestamp, float, integer, unsigned, boolean, string) are
 validated against the **real InfluxDB 1.7.11 encoder** in unit tests
@@ -342,6 +345,47 @@ it with a clear error rather than corrupting the migration. To change a shaping
 flag, start a fresh `--checkpoint` (a full re-migration). Checkpoints created
 by tsm2arc ≤ 0.1.2 resume unchanged as long as the new flags stay at their
 defaults.
+
+## InfluxDB 3 (Core/Enterprise) sources — experimental
+
+tsm2arc can read **InfluxDB 3** (3.0+) Parquet-engine object stores on local
+disk (`--object-store file`, or any store synced to a directory). Point
+`--datadir` at the store root (the directory holding the node prefix) — the
+layout is auto-detected, each live table migrates as one unit, and everything
+else (chunking, resume, `--workers`, `--inflight`, `--analyze`, `--redact`,
+measurement policies) works as for 1.x/2.x.
+
+```bash
+tsm2arc --datadir /mnt/influxdb3-store --arc-url https://arc.example.net --dry-run
+```
+
+What to know before running:
+
+- **Support tiers.** Core 3.0–3.11 on the Parquet engine is the target.
+  Enterprise on the Parquet engine works **only if the compactor has not run**
+  (compacted stores reference data through proprietary state; tsm2arc detects
+  the resulting dangling references and refuses rather than migrating holes).
+  The Pacha (`.pt`) engine is out of scope — migrate the retained parquet
+  before `cleanup-parquet`, or export via query from a running server.
+- **The WAL gate.** InfluxDB 3 keeps up to ~10 minutes of the newest writes
+  only in its WAL, and a clean shutdown does **not** flush them (no snapshot
+  on shutdown). tsm2arc compares WAL sequences against the newest snapshot
+  and **refuses** when un-snapshotted WAL exists; either run the server until
+  a newer snapshot appears, or accept the gap explicitly with `--skip-wal`.
+  Native WAL decoding is planned (#10).
+- **Names come from the catalog.** JSON-era catalogs (3.0–3.9, plus stores
+  upgraded to 3.10+ that retain the previous JSON tree) resolve
+  automatically, including catalog log replay. Fresh 3.10+/3.11 stores use a
+  binary catalog this build cannot read yet: provide `--v3-db db_id=name` and
+  `--v3-table db_id/table_id=name:tag1,tag2,...` (tags in first-write order —
+  the table's series key); unresolved ids fail loudly, never guess.
+- **Duplicates resolve last-write-wins deterministically** (the same
+  overwrite semantics InfluxDB 3 applies at query time), and emission order
+  is a pure function of the store, so resume is byte-exact — the live file
+  set is part of the checkpoint fingerprint, and a store that changed under
+  a checkpoint fails as "different settings".
+- **Not yet:** `s3://` sources (sync to a volume first), WAL decode, binary
+  catalogs, multi-node (Enterprise cluster) stores. Tracking: [#10](https://github.com/Basekick-Labs/tsm2arc/issues/10).
 
 ## Validate against a local InfluxDB
 
