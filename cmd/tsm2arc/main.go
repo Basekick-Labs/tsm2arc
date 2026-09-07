@@ -296,6 +296,11 @@ func main() {
 				"      system buckets CANNOT be skipped. Provide --bolt or copy influxd.bolt\n"+
 				"      next to the engine/ dir to get names and system-bucket filtering.\n", boltPath)
 		}
+	case discover.Version3:
+		fatal("detected an InfluxDB 3 (Core/Enterprise) object store at %s.\n"+
+			"  InfluxDB 3 Parquet-engine sources are under active development for this tool\n"+
+			"  (see https://github.com/Basekick-Labs/tsm2arc/issues/10); this build reads\n"+
+			"  InfluxDB 1.x and 2.x TSM data directories only.", resolvedData)
 	case discover.Version1:
 		fmt.Fprintf(infow, "detected InfluxDB 1.x layout at %s\n", resolvedData)
 	default:
