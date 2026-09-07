@@ -46,6 +46,11 @@ func (e CatalogEra) String() string {
 // (--db-name/--table-name flags, or the native decoder once it ships).
 var ErrBinaryCatalog = errors.New("catalog is in the binary catalog/v3 format (InfluxDB 3.10+); names cannot be read by this build")
 
+// ErrNoCatalog reports that no catalog tree exists under the given prefix.
+// On Enterprise stores the catalog lives under the CLUSTER prefix, not the
+// node prefix — callers retry there.
+var ErrNoCatalog = errors.New("no InfluxDB 3 catalog found")
+
 // Catalog is the resolved id→name mapping plus per-table series-key order.
 type Catalog struct {
 	Era      CatalogEra
@@ -170,7 +175,7 @@ func LoadCatalog(f vfs.FS, node string) (*Catalog, error) {
 		c.Era = EraCatalogs
 		return c, nil
 	default:
-		return nil, fmt.Errorf("no InfluxDB 3 catalog found under %s (looked for catalogs/, catalog/v2, catalog/v3)", node)
+		return nil, fmt.Errorf("%w under %s (looked for catalogs/, catalog/v2, catalog/v3)", ErrNoCatalog, node)
 	}
 }
 

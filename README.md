@@ -366,12 +366,19 @@ tsm2arc --datadir s3://my-bucket/influxdb3 --arc-url https://arc.example.net --d
 
 What to know before running:
 
-- **Support tiers.** Core 3.0–3.11 on the Parquet engine is the target.
-  Enterprise on the Parquet engine works **only if the compactor has not run**
-  (compacted stores reference data through proprietary state; tsm2arc detects
-  the resulting dangling references and refuses rather than migrating holes).
-  The Pacha (`.pt`) engine is out of scope — migrate the retained parquet
-  before `cleanup-parquet`, or export via query from a running server.
+- **Support tiers** (each behavior validated against real stores from live
+  licensed servers):
+  - **Core 3.0–3.11** (Parquet engine): fully supported.
+  - **Enterprise** (Parquet engine): supported **when the compactor has not
+    run** — Enterprise cluster layouts (catalog under the cluster prefix)
+    resolve automatically. When compactor state exists (`cs/`/`cd/`/`c/`),
+    compacted data lives behind a proprietary index and the original gen1
+    files get deleted, so tsm2arc **refuses** rather than migrating holes;
+    the supported recipes (nodes in `--mode ingest,query`, migrate before
+    compaction, or query-export) are printed with the refusal.
+  - **Pacha-tree engine** (`.pt`, Enterprise 3.11+ new clusters): out of
+    scope; detected and explained — migrate the retained parquet before
+    `cleanup-parquet`, or export via query from the running server.
 - **The WAL is read natively.** InfluxDB 3 keeps up to ~10 minutes of the
   newest writes only in its WAL, and a clean shutdown does **not** flush them
   (no snapshot on shutdown). tsm2arc decodes un-snapshotted WAL files

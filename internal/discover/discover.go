@@ -67,10 +67,15 @@ func detectV3(path string) (root string, ok bool) {
 	return "", false
 }
 
-// v3NodeMarkers counts InfluxDB 3 persistence directories under dir.
+// v3NodeMarkers counts InfluxDB 3 persistence directories under dir. The
+// Parquet-engine markers (wal/snapshots/dbs/catalog*) identify node and
+// cluster prefixes; cv2/ and pt_snapshots/ are the Pacha-tree engine's
+// artifacts (Enterprise 3.11+), counted so those stores classify as v3 and
+// reach the v3 path's precise "Pacha is out of scope" explanation instead of
+// falling through to a confusing 1.x probe.
 func v3NodeMarkers(dir string) int {
 	n := 0
-	for _, m := range []string{"wal", "snapshots", "dbs", "catalog", "catalogs"} {
+	for _, m := range []string{"wal", "snapshots", "dbs", "catalog", "catalogs", "cv2", "pt_snapshots"} {
 		if fi, err := os.Stat(filepath.Join(dir, m)); err == nil && fi.IsDir() {
 			n++
 		}
