@@ -378,23 +378,20 @@ What to know before running:
   in-process (the upstream codec compiled to WebAssembly, embedded in the
   binary — still a single static Go binary) and merges those rows into the
   migration, so nothing is left behind; `--skip-wal` skips the decode
-  explicitly. Exception: on fresh 3.10+/3.11 stores the binary catalog cannot
-  yet name the WAL's column ids, so those still need a newer snapshot or
-  `--skip-wal`.
-- **Names come from the catalog.** JSON-era catalogs (3.0–3.9, plus stores
-  upgraded to 3.10+ that retain the previous JSON tree) resolve
-  automatically, including catalog log replay. Fresh 3.10+/3.11 stores use a
-  binary catalog this build cannot read yet: provide `--v3-db db_id=name` and
-  `--v3-table db_id/table_id=name:tag1,tag2,...` (tags in first-write order —
-  the table's series key); unresolved ids fail loudly, never guess.
+  explicitly.
+- **Names come from the catalog — every era.** JSON catalogs (3.0–3.9) and
+  the binary 3.10+/3.11 catalog both resolve automatically, including the
+  mandatory log replay past the last checkpoint (catalogs checkpoint lazily;
+  recent databases/tables often exist only in logs). `--v3-db` /
+  `--v3-table` remain as manual overrides; unresolved ids fail loudly,
+  never guess.
 - **Duplicates resolve last-write-wins deterministically** (the same
   overwrite semantics InfluxDB 3 applies at query time), and emission order
   is a pure function of the store, so resume is byte-exact — the live file
   set is part of the checkpoint fingerprint, and a store that changed under
   a checkpoint fails as "different settings".
-- **Not yet:** binary catalogs (3.10+ stores need `--v3-db`/`--v3-table`,
-  and their WAL needs `--skip-wal`), multi-node (Enterprise cluster) stores,
-  GCS/Azure sources. Tracking: [#10](https://github.com/Basekick-Labs/tsm2arc/issues/10).
+- **Not yet:** multi-node (Enterprise cluster) stores, GCS/Azure sources,
+  Enterprise-with-compaction validation. Tracking: [#10](https://github.com/Basekick-Labs/tsm2arc/issues/10).
 
 ## Validate against a local InfluxDB
 
