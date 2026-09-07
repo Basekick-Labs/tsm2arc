@@ -92,13 +92,25 @@ struct SnapshotDetails {
     forced: bool,
 }
 
+mod catalog;
+
 fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_default();
     let mut payload = Vec::new();
     if let Err(e) = std::io::stdin().read_to_end(&mut payload) {
         eprintln!("read stdin: {e}");
         std::process::exit(1);
     }
-    let contents: WalContents = match bitcode::deserialize(&payload) {
+    match mode.as_str() {
+        "catalog" => catalog_mode(&payload),
+        _ => wal_mode(&payload),
+    }
+}
+
+/// WAL mode: stdin is one WAL file's bitcode payload (serde mode); stdout is
+/// the WalContents as JSON.
+fn wal_mode(payload: &[u8]) {
+    let contents: WalContents = match bitcode::deserialize(payload) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("bitcode decode: {e}");
@@ -111,4 +123,47 @@ fn main() {
         std::process::exit(1);
     }
     let _ = std::io::stdout().flush();
+}
+
+/// Catalog mode: stdin is a stream of [u16 LE record id][u32 LE body length]
+/// [body] entries (the Go caller strips file and record framing); stdout is
+/// one JSON line per record, in order: {"id":N,"record":{...}} for decoded
+/// types, {"id":N,"skip":true} for types the migration does not need.
+fn catalog_mode(payload: &[u8]) {
+    let mut off = 0usize;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    while off < payload.len() {
+        if payload.len() - off < 6 {
+            eprintln!("truncated record stream at offset {off}");
+            std::process::exit(1);
+        }
+        let id = u16::from_le_bytes([payload[off], payload[off + 1]]);
+        let len = u32::from_le_bytes([
+            payload[off + 2],
+            payload[off + 3],
+            payload[off + 4],
+            payload[off + 5],
+        ]) as usize;
+        off += 6;
+        if payload.len() - off < len {
+            eprintln!("record id {id} body truncated at offset {off}");
+            std::process::exit(1);
+        }
+        let body = &payload[off..off + len];
+        off += len;
+        match catalog::decode_record(id, body) {
+            Ok(Some(json)) => {
+                let _ = writeln!(w, "{{\"id\":{id},\"record\":{json}}}");
+            }
+            Ok(None) => {
+                let _ = writeln!(w, "{{\"id\":{id},\"skip\":true}}");
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    let _ = w.flush();
 }

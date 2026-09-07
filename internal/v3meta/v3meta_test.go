@@ -1,7 +1,6 @@
 package v3meta
 
 import (
-	"errors"
 	"math"
 	"reflect"
 	"strings"
@@ -55,10 +54,45 @@ func TestLoadCatalogEraB(t *testing.T) {
 	assertCatalogShape(t, c)
 }
 
+// The v311 fixture's catalog is the binary catalog/v3 format (record history
+// framing, bitcode derive-mode bodies) written by a real 3.11.2 server —
+// decoding it through the embedded wasm decoder must yield the same names,
+// insertion-order series keys, and column-id maps the JSON eras yield.
 func TestLoadCatalogEraCBinary(t *testing.T) {
-	_, err := LoadCatalog(vfs.NewLocal("testdata/v311"), "node0")
-	if !errors.Is(err, ErrBinaryCatalog) {
-		t.Fatalf("err = %v, want ErrBinaryCatalog", err)
+	c, err := LoadCatalog(vfs.NewLocal("testdata/v311"), "node0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Era != EraCatalogV3 || c.Stale {
+		t.Fatalf("era = %v stale = %v, want catalog/v3, not stale", c.Era, c.Stale)
+	}
+	names := map[uint32]string{}
+	for id, db := range c.Databases {
+		names[id] = db.Name
+	}
+	want := map[uint32]string{0: "_internal", 1: "fleet", 2: "telemetry"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("databases = %v, want %v", names, want)
+	}
+	fleet := c.Databases[1]
+	cpu, hb := fleet.Tables[0], fleet.Tables[2]
+	if cpu == nil || cpu.Name != "cpu" || hb == nil || hb.Name != "heartbeat" {
+		t.Fatalf("fleet tables = %+v", fleet.Tables)
+	}
+	if !reflect.DeepEqual(cpu.SeriesKey, []string{"host", "region"}) {
+		t.Fatalf("cpu series key = %v, want [host region]", cpu.SeriesKey)
+	}
+	if !reflect.DeepEqual(hb.SeriesKey, []string{"src"}) {
+		t.Fatalf("heartbeat series key = %v, want [src]", hb.SeriesKey)
+	}
+	// Column ids must name every column the WAL could reference.
+	byName := map[string]ColumnKind{}
+	for _, col := range cpu.Columns {
+		byName[col.Name] = col.Kind
+	}
+	wantKinds := map[string]ColumnKind{"host": ColTag, "region": ColTag, "usage": ColField, "load": ColField, "time": ColTime}
+	if !reflect.DeepEqual(byName, wantKinds) {
+		t.Fatalf("cpu columns = %v, want %v", byName, wantKinds)
 	}
 }
 

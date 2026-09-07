@@ -147,8 +147,8 @@ func main() {
 	flag.Var(&dbFilterArg, "database-filter", "only migrate this source database/bucket (repeatable)")
 	flag.Var(&dbMapArg, "db-map", "rename source DB/bucket to Arc DB, form old=new (repeatable)")
 	flag.Var(&mMapArg, "measurement-map", "rename a source measurement, form old=new; new must satisfy Arc's name rule (repeatable)")
-	flag.Var(&v3DBArg, "v3-db", "InfluxDB 3 sources: name a database id, form db_id=name (repeatable; overrides/supplements the catalog, required per id when the catalog is the unreadable binary 3.10+ format)")
-	flag.Var(&v3TableArg, "v3-table", "InfluxDB 3 sources: name a table and its series key, form db_id/table_id=name:tag1,tag2,... with tags in FIRST-WRITE order (repeatable; ':' with no tags for a tagless table)")
+	flag.Var(&v3DBArg, "v3-db", "InfluxDB 3 sources: override a database id's name, form db_id=name (repeatable; the catalog resolves names automatically, including binary 3.10+ catalogs)")
+	flag.Var(&v3TableArg, "v3-table", "InfluxDB 3 sources: override a table's name and series key, form db_id/table_id=name:tag1,tag2,... with tags in FIRST-WRITE order (repeatable; ':' with no tags for a tagless table; the catalog resolves these automatically)")
 	flag.Parse()
 
 	if *showVersion {

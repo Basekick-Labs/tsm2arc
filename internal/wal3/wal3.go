@@ -191,32 +191,42 @@ func (d *Decoder) Decode(ctx context.Context, file []byte) (*WalContents, error)
 		return nil, fmt.Errorf("WAL CRC mismatch (file corrupt or truncated)")
 	}
 
+	stdout, err := d.run(ctx, payload)
+	if err != nil {
+		return nil, err
+	}
+	var out WalContents
+	if err := json.Unmarshal(stdout, &out); err != nil {
+		return nil, fmt.Errorf("parse decoder output: %w", err)
+	}
+	return &out, nil
+}
+
+// run executes the embedded module once with the given stdin and extra args,
+// returning its stdout.
+func (d *Decoder) run(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
 	var stdout, stderr bytes.Buffer
 	cfg := wazero.NewModuleConfig().
-		WithStdin(bytes.NewReader(payload)).
+		WithStdin(bytes.NewReader(stdin)).
 		WithStdout(&stdout).
 		WithStderr(&stderr).
+		WithArgs(append([]string{"waldecoder"}, args...)...).
 		WithName("") // anonymous: allows concurrent instantiations
 
 	// wazero instantiation of the same compiled module is cheap; serialize
-	// anyway — WAL decode is a pre-flight step, not a hot path.
+	// anyway — decoding is a pre-flight step, not a hot path.
 	d.mu.Lock()
 	mod, err := d.runtime.InstantiateModule(ctx, d.compiled, cfg)
 	d.mu.Unlock()
 	if err != nil {
 		// A non-zero exit surfaces as an error here; include stderr.
 		if msg := bytes.TrimSpace(stderr.Bytes()); len(msg) > 0 {
-			return nil, fmt.Errorf("WAL decoder: %s", msg)
+			return nil, fmt.Errorf("decoder: %s", msg)
 		}
-		return nil, fmt.Errorf("WAL decoder: %w", err)
+		return nil, fmt.Errorf("decoder: %w", err)
 	}
 	if mod != nil {
 		_ = mod.Close(ctx)
 	}
-
-	var out WalContents
-	if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
-		return nil, fmt.Errorf("parse decoder output: %w", err)
-	}
-	return &out, nil
+	return stdout.Bytes(), nil
 }

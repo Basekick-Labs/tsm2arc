@@ -137,16 +137,24 @@ func LoadCatalog(f vfs.FS, node string) (*Catalog, error) {
 	}
 
 	switch {
-	case v3 && v2:
-		c, err := loadJSONCatalog(f, node+"/catalog/v2/snapshot", node+"/catalog/v2/logs")
-		if err != nil {
-			return nil, fmt.Errorf("catalog/v3 store: reading preserved catalog/v2 fallback: %w", err)
-		}
-		c.Era = EraCatalogV3
-		c.Stale = true
-		return c, nil
 	case v3:
-		return nil, ErrBinaryCatalog
+		c, binErr := loadBinaryCatalog(f, node)
+		if binErr == nil {
+			return c, nil
+		}
+		// A preserved pre-migration JSON tree is a stale fallback: correct
+		// for everything created before the 3.10 upgrade, blind to anything
+		// after it. Only worth using when the binary read failed.
+		if v2 {
+			c, err := loadJSONCatalog(f, node+"/catalog/v2/snapshot", node+"/catalog/v2/logs")
+			if err != nil {
+				return nil, fmt.Errorf("catalog/v3 read failed (%v) and the preserved catalog/v2 fallback failed too: %w", binErr, err)
+			}
+			c.Era = EraCatalogV3
+			c.Stale = true
+			return c, nil
+		}
+		return nil, fmt.Errorf("%w (%v)", ErrBinaryCatalog, binErr)
 	case v2:
 		c, err := loadJSONCatalog(f, node+"/catalog/v2/snapshot", node+"/catalog/v2/logs")
 		if err != nil {
