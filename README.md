@@ -349,14 +349,19 @@ defaults.
 ## InfluxDB 3 (Core/Enterprise) sources — experimental
 
 tsm2arc can read **InfluxDB 3** (3.0+) Parquet-engine object stores on local
-disk (`--object-store file`, or any store synced to a directory). Point
-`--datadir` at the store root (the directory holding the node prefix) — the
-layout is auto-detected, each live table migrates as one unit, and everything
-else (chunking, resume, `--workers`, `--inflight`, `--analyze`, `--redact`,
-measurement policies) works as for 1.x/2.x.
+disk (`--object-store file`, or any store synced to a directory) **or in
+place on S3** with `--datadir s3://bucket/prefix` — listings and range reads,
+no scratch-volume sync. Point `--datadir` at the store root (the
+directory/prefix holding the node prefix) — the layout is auto-detected, each
+live table migrates as one unit, and everything else (chunking, resume,
+`--workers`, `--inflight`, `--analyze`, `--redact`, measurement policies)
+works as for 1.x/2.x.
 
 ```bash
 tsm2arc --datadir /mnt/influxdb3-store --arc-url https://arc.example.net --dry-run
+# or straight from S3 (credentials from the standard AWS chain;
+# --s3-endpoint for MinIO/on-prem gateways):
+tsm2arc --datadir s3://my-bucket/influxdb3 --arc-url https://arc.example.net --dry-run
 ```
 
 What to know before running:
@@ -384,8 +389,8 @@ What to know before running:
   is a pure function of the store, so resume is byte-exact — the live file
   set is part of the checkpoint fingerprint, and a store that changed under
   a checkpoint fails as "different settings".
-- **Not yet:** `s3://` sources (sync to a volume first), WAL decode, binary
-  catalogs, multi-node (Enterprise cluster) stores. Tracking: [#10](https://github.com/Basekick-Labs/tsm2arc/issues/10).
+- **Not yet:** WAL decode, binary catalogs, multi-node (Enterprise cluster)
+  stores, GCS/Azure sources. Tracking: [#10](https://github.com/Basekick-Labs/tsm2arc/issues/10).
 
 ## Validate against a local InfluxDB
 

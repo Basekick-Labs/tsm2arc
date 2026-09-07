@@ -103,13 +103,36 @@ func (l *Local) ReaderAt(path string) (ReaderAtCloser, int64, error) {
 }
 
 // HasPrefix reports whether any object exists under prefix — the cheap
-// existence probe layout detection uses.
+// existence probe layout detection uses. Implementations with a cheaper
+// answer than a recursive List (Local: one stat; S3: a MaxKeys=1 request)
+// provide it through the unexported prefixChecker interface.
 func HasPrefix(f FS, prefix string) bool {
-	// For Local this stats the directory instead of walking it.
 	if l, ok := f.(*Local); ok {
 		fi, err := os.Stat(l.abs(prefix))
 		return err == nil && fi.IsDir()
 	}
+	if pc, ok := f.(prefixChecker); ok {
+		return pc.hasPrefix(strings.TrimSuffix(prefix, "/"))
+	}
 	objs, err := f.List(strings.TrimSuffix(prefix, "/"))
 	return err == nil && len(objs) > 0
+}
+
+// ListDir implements DirLister for Local: immediate child directories.
+func (l *Local) ListDir(prefix string) ([]string, error) {
+	entries, err := os.ReadDir(l.abs(prefix))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, e := range entries {
+		if e.IsDir() {
+			out = append(out, e.Name())
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }
