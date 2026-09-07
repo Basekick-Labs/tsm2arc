@@ -1,0 +1,156 @@
+{
+  "version": "1",
+  "node_id": "node30",
+  "next_file_id": 24,
+  "snapshot_sequence_number": 2,
+  "wal_file_sequence_number": 12,
+  "catalog_sequence_number": 5,
+  "parquet_size_bytes": 24792,
+  "row_count": 60,
+  "min_time": 1788805404000000000,
+  "max_time": 1788805528000000000,
+  "databases": [
+    [
+      2,
+      {
+        "tables": [
+          [
+            0,
+            [
+              {
+                "id": 12,
+                "path": "node30/dbs/telemetry-2/cpu-0/2026-09-07/18-23/0000000012.parquet",
+                "size_bytes": 2519,
+                "row_count": 5,
+                "chunk_time": 1788805380000000000,
+                "min_time": 1788805404000000000,
+                "max_time": 1788805408000000000
+              },
+              {
+                "id": 17,
+                "path": "node30/dbs/telemetry-2/cpu-0/2026-09-07/18-25/0000000012.parquet",
+                "size_bytes": 2519,
+                "row_count": 5,
+                "chunk_time": 1788805500000000000,
+                "min_time": 1788805524000000000,
+                "max_time": 1788805528000000000
+              },
+              {
+                "id": 22,
+                "path": "node30/dbs/telemetry-2/cpu-0/2026-09-07/18-24/0000000012.parquet",
+                "size_bytes": 2519,
+                "row_count": 5,
+                "chunk_time": 1788805440000000000,
+                "min_time": 1788805464000000000,
+                "max_time": 1788805468000000000
+              }
+            ]
+          ],
+          [
+            1,
+            [
+              {
+                "id": 14,
+                "path": "node30/dbs/telemetry-2/mem-1/2026-09-07/18-24/0000000012.parquet",
+                "size_bytes": 1613,
+                "row_count": 5,
+                "chunk_time": 1788805440000000000,
+                "min_time": 1788805464000000000,
+                "max_time": 1788805468000000000
+              },
+              {
+                "id": 16,
+                "path": "node30/dbs/telemetry-2/mem-1/2026-09-07/18-23/0000000012.parquet",
+                "size_bytes": 1613,
+                "row_count": 5,
+                "chunk_time": 1788805380000000000,
+                "min_time": 1788805404000000000,
+                "max_time": 1788805408000000000
+              },
+              {
+                "id": 21,
+                "path": "node30/dbs/telemetry-2/mem-1/2026-09-07/18-25/0000000012.parquet",
+                "size_bytes": 1613,
+                "row_count": 5,
+                "chunk_time": 1788805500000000000,
+                "min_time": 1788805524000000000,
+                "max_time": 1788805528000000000
+              }
+            ]
+          ]
+        ]
+      }
+    ],
+    [
+      1,
+      {
+        "tables": [
+          [
+            0,
+            [
+              {
+                "id": 13,
+                "path": "node30/dbs/fleet-1/cpu-0/2026-09-07/18-25/0000000012.parquet",
+                "size_bytes": 2519,
+                "row_count": 5,
+                "chunk_time": 1788805500000000000,
+                "min_time": 1788805524000000000,
+                "max_time": 1788805528000000000
+              },
+              {
+                "id": 18,
+                "path": "node30/dbs/fleet-1/cpu-0/2026-09-07/18-24/0000000012.parquet",
+                "size_bytes": 2519,
+                "row_count": 5,
+                "chunk_time": 1788805440000000000,
+                "min_time": 1788805464000000000,
+                "max_time": 1788805468000000000
+              },
+              {
+                "id": 20,
+                "path": "node30/dbs/fleet-1/cpu-0/2026-09-07/18-23/0000000012.parquet",
+                "size_bytes": 2519,
+                "row_count": 5,
+                "chunk_time": 1788805380000000000,
+                "min_time": 1788805404000000000,
+                "max_time": 1788805408000000000
+              }
+            ]
+          ],
+          [
+            1,
+            [
+              {
+                "id": 15,
+                "path": "node30/dbs/fleet-1/mem-1/2026-09-07/18-23/0000000012.parquet",
+                "size_bytes": 1613,
+                "row_count": 5,
+                "chunk_time": 1788805380000000000,
+                "min_time": 1788805404000000000,
+                "max_time": 1788805408000000000
+              },
+              {
+                "id": 19,
+                "path": "node30/dbs/fleet-1/mem-1/2026-09-07/18-24/0000000012.parquet",
+                "size_bytes": 1613,
+                "row_count": 5,
+                "chunk_time": 1788805440000000000,
+                "min_time": 1788805464000000000,
+                "max_time": 1788805468000000000
+              },
+              {
+                "id": 23,
+                "path": "node30/dbs/fleet-1/mem-1/2026-09-07/18-25/0000000012.parquet",
+                "size_bytes": 1613,
+                "row_count": 5,
+                "chunk_time": 1788805500000000000,
+                "min_time": 1788805524000000000,
+                "max_time": 1788805528000000000
+              }
+            ]
+          ]
+        ]
+      }
+    ]
+  ]
+}
