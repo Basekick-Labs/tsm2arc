@@ -372,12 +372,15 @@ What to know before running:
   the resulting dangling references and refuses rather than migrating holes).
   The Pacha (`.pt`) engine is out of scope — migrate the retained parquet
   before `cleanup-parquet`, or export via query from a running server.
-- **The WAL gate.** InfluxDB 3 keeps up to ~10 minutes of the newest writes
-  only in its WAL, and a clean shutdown does **not** flush them (no snapshot
-  on shutdown). tsm2arc compares WAL sequences against the newest snapshot
-  and **refuses** when un-snapshotted WAL exists; either run the server until
-  a newer snapshot appears, or accept the gap explicitly with `--skip-wal`.
-  Native WAL decoding is planned (#10).
+- **The WAL is read natively.** InfluxDB 3 keeps up to ~10 minutes of the
+  newest writes only in its WAL, and a clean shutdown does **not** flush them
+  (no snapshot on shutdown). tsm2arc decodes un-snapshotted WAL files
+  in-process (the upstream codec compiled to WebAssembly, embedded in the
+  binary — still a single static Go binary) and merges those rows into the
+  migration, so nothing is left behind; `--skip-wal` skips the decode
+  explicitly. Exception: on fresh 3.10+/3.11 stores the binary catalog cannot
+  yet name the WAL's column ids, so those still need a newer snapshot or
+  `--skip-wal`.
 - **Names come from the catalog.** JSON-era catalogs (3.0–3.9, plus stores
   upgraded to 3.10+ that retain the previous JSON tree) resolve
   automatically, including catalog log replay. Fresh 3.10+/3.11 stores use a
@@ -389,8 +392,9 @@ What to know before running:
   is a pure function of the store, so resume is byte-exact — the live file
   set is part of the checkpoint fingerprint, and a store that changed under
   a checkpoint fails as "different settings".
-- **Not yet:** WAL decode, binary catalogs, multi-node (Enterprise cluster)
-  stores, GCS/Azure sources. Tracking: [#10](https://github.com/Basekick-Labs/tsm2arc/issues/10).
+- **Not yet:** binary catalogs (3.10+ stores need `--v3-db`/`--v3-table`,
+  and their WAL needs `--skip-wal`), multi-node (Enterprise cluster) stores,
+  GCS/Azure sources. Tracking: [#10](https://github.com/Basekick-Labs/tsm2arc/issues/10).
 
 ## Validate against a local InfluxDB
 

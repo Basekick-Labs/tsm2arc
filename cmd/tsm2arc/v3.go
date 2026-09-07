@@ -34,6 +34,10 @@ type v3Source struct {
 	catalog   *v3meta.Catalog // nil when the catalog is binary and flags covered it
 	skipWAL   bool
 	snapshots int
+	// walDecodedMax is the highest WAL sequence folded into extraction (0
+	// when nothing was decoded); part of the config fingerprint because
+	// decoded WAL rows shape chunk boundaries.
+	walDecodedMax uint64
 }
 
 // v3Options are the operator inputs specific to v3 stores.
@@ -141,20 +145,6 @@ func setupV3FS(f vfs.FS, node, label string, opt v3Options, infow io.Writer) ([]
 	if err != nil {
 		return nil, nil, err
 	}
-	if n := len(wal.Unsnapshotted); n > 0 && !opt.analyze {
-		if !opt.skipWAL {
-			return nil, nil, fmt.Errorf(
-				"%d WAL file(s) (sequences %d-%d) hold writes not yet persisted to any parquet file — up to ~10 minutes of the newest data.\n"+
-					"  A clean server shutdown does NOT flush them (InfluxDB 3 never snapshots on shutdown). Options:\n"+
-					"    a) run the server until a snapshot NEWER than WAL sequence %d appears under %s/snapshots/ (a brief restart is not enough), then re-run;\n"+
-					"    b) accept the gap explicitly with --skip-wal (the skipped span is printed and your Arc data will be missing those writes);\n"+
-					"    c) native WAL decoding is planned (https://github.com/Basekick-Labs/tsm2arc/issues/10).\n"+
-					"  Note: WAL files holding only no-op entries trip this gate conservatively.",
-				n, wal.Unsnapshotted[0], wal.Unsnapshotted[len(wal.Unsnapshotted)-1], wal.MaxSeq, node)
-		}
-		fmt.Fprintf(infow, "WARN: --skip-wal: leaving %d un-snapshotted WAL file(s) behind (sequences %d-%d) — the newest writes will be MISSING from Arc\n",
-			n, wal.Unsnapshotted[0], wal.Unsnapshotted[len(wal.Unsnapshotted)-1])
-	}
 
 	// Names: catalog first, operator flags on top. A binary (3.10+) catalog
 	// with no preserved JSON fallback is fine as long as the flags cover
@@ -162,6 +152,39 @@ func setupV3FS(f vfs.FS, node, label string, opt v3Options, infow io.Writer) ([]
 	cat, catErr := v3meta.LoadCatalog(f, node)
 	if catErr != nil && !errors.Is(catErr, v3meta.ErrBinaryCatalog) {
 		return nil, nil, catErr
+	}
+
+	// Un-snapshotted WAL holds the newest writes (a clean server shutdown
+	// does NOT flush them — no snapshot on shutdown). Decode it natively so
+	// nothing is dropped; --skip-wal skips the decode explicitly. Decoding
+	// needs the catalog's column-id map (WAL rows reference columns by id
+	// only), which a binary 3.10+ catalog cannot provide yet.
+	var walExtras map[v3meta.TableKey]map[int64][]extract3.MemRow
+	var walDecodedMax uint64
+	if n := len(wal.Unsnapshotted); n > 0 && !opt.analyze {
+		switch {
+		case opt.skipWAL:
+			fmt.Fprintf(infow, "WARN: --skip-wal: leaving %d un-snapshotted WAL file(s) behind (sequences %d-%d) — the newest writes will be MISSING from Arc\n",
+				n, wal.Unsnapshotted[0], wal.Unsnapshotted[len(wal.Unsnapshotted)-1])
+		case cat == nil || cat.Stale:
+			return nil, nil, fmt.Errorf(
+				"%d WAL file(s) (sequences %d-%d) hold writes not yet persisted to any parquet file, and the catalog is the binary 3.10+ format, so the WAL's column ids cannot be named.\n"+
+					"  Options: run the server until a snapshot NEWER than WAL sequence %d appears under %s/snapshots/ (a brief restart is not enough), then re-run;\n"+
+					"  or accept the gap explicitly with --skip-wal. Binary-catalog decoding is planned (https://github.com/Basekick-Labs/tsm2arc/issues/10).",
+				n, wal.Unsnapshotted[0], wal.Unsnapshotted[len(wal.Unsnapshotted)-1], wal.MaxSeq, node)
+		default:
+			rows := 0
+			walExtras, rows, err = decodeWAL(f, node, wal.Unsnapshotted, cat)
+			if err != nil {
+				return nil, nil, fmt.Errorf(
+					"decoding %d un-snapshotted WAL file(s) (sequences %d-%d): %w\n"+
+						"  Fallbacks: run the server until a newer snapshot appears, then re-run; or accept the gap with --skip-wal.",
+					n, wal.Unsnapshotted[0], wal.Unsnapshotted[len(wal.Unsnapshotted)-1], err)
+			}
+			walDecodedMax = wal.MaxSeq
+			fmt.Fprintf(infow, "decoded %d row(s) from %d un-snapshotted WAL file(s) (sequences %d-%d); nothing left behind\n",
+				rows, n, wal.Unsnapshotted[0], wal.Unsnapshotted[len(wal.Unsnapshotted)-1])
+		}
 	}
 	if cat != nil && cat.Stale {
 		fmt.Fprintf(infow, "WARN: catalog is the binary 3.10+ format; using the preserved pre-migration JSON catalog — correct for data written before the upgrade, blind to databases/tables created after it. Override with --v3-db/--v3-table if needed.\n")
@@ -196,10 +219,21 @@ func setupV3FS(f vfs.FS, node, label string, opt v3Options, infow io.Writer) ([]
 			danglingCount(rec), strings.Join(parts, ", "))
 	}
 
-	src := &v3Source{fs: f, node: node, tables: map[string]extract3.Table{}, live: live, wal: wal, catalog: cat, skipWAL: opt.skipWAL, snapshots: len(snaps)}
+	src := &v3Source{fs: f, node: node, tables: map[string]extract3.Table{}, live: live, wal: wal, catalog: cat, skipWAL: opt.skipWAL, snapshots: len(snaps), walDecodedMax: walDecodedMax}
 	var shards []discover.Shard
 	var unresolved []string
-	for k, files := range live.Tables {
+	// Iterate the union of live-set tables and WAL-only tables: a table whose
+	// data was never snapshotted has no parquet files yet and exists ONLY in
+	// the decoded WAL.
+	allTables := map[v3meta.TableKey]bool{}
+	for k := range live.Tables {
+		allTables[k] = true
+	}
+	for k := range walExtras {
+		allTables[k] = true
+	}
+	for k := range allTables {
+		files := live.Tables[k]
 		dbName, tblName, seriesKey, ok := names.resolve(k)
 		if !ok {
 			unresolved = append(unresolved, k.String())
@@ -227,6 +261,7 @@ func setupV3FS(f vfs.FS, node, label string, opt v3Options, infow io.Writer) ([]
 			Measurement: tblName,
 			SeriesKey:   seriesKey,
 			Files:       fl,
+			Extra:       walExtras[k],
 		}
 		shards = append(shards, sh)
 	}
@@ -417,6 +452,9 @@ func (s *v3Source) fingerprint() string {
 		fmt.Fprintf(h, "%s=%s;", ks, strings.Join(ids, ","))
 	}
 	fmt.Fprintf(h, "wal=%d", s.live.WALFileSequenceNumber)
+	if s.walDecodedMax > 0 {
+		fmt.Fprintf(h, ";waldecoded=%d", s.walDecodedMax)
+	}
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
@@ -503,7 +541,7 @@ func runAnalyzeV3(cfg runConfig, root string) {
 	fmt.Printf("InfluxDB 3 store %s: %d snapshot(s), newest %d; %d WAL file(s), %d NOT yet snapshotted\n",
 		rep.Store, rep.Snapshots, rep.NewestSnapshot, rep.WALFiles, rep.UnsnapshottedWAL)
 	if rep.UnsnapshottedWAL > 0 {
-		fmt.Printf("  WARNING: un-snapshotted WAL holds the newest writes; a load will refuse without --skip-wal\n")
+		fmt.Printf("  NOTE: un-snapshotted WAL holds the newest writes; a load decodes it natively (or skips it with --skip-wal)\n")
 	}
 	for _, t := range rep.Tables {
 		fmt.Printf("  %s/%s: %d file(s), %.1f MiB, %d row(s), %d bucket(s), overlap %.2f (max %d files/bucket)",

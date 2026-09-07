@@ -74,11 +74,48 @@ type DatabaseMeta struct {
 // in INSERTION order — the order tags first appeared in writes. This is the
 // table's physical sort order in every parquet file (with time appended), so
 // the extractor's merge comparator depends on it. It is NOT lexicographic.
+//
+// Columns maps the table's column ids to names and kinds — the WAL
+// references columns by id only, so decoding WAL rows requires this map.
 type TableMeta struct {
 	ID        uint32
 	Name      string
 	Deleted   bool
 	SeriesKey []string
+	Columns   map[uint32]CatColumn
+}
+
+// CatColumn is one catalog column: its name and role.
+type CatColumn struct {
+	Name string
+	Kind ColumnKind
+}
+
+// ColumnKind is a column's role in the schema.
+type ColumnKind int
+
+const (
+	ColTag ColumnKind = iota
+	ColField
+	ColTime
+)
+
+func kindFromDataType(dt string) ColumnKind {
+	switch dt {
+	case "Tag":
+		return ColTag
+	case "Timestamp", "Time":
+		return ColTime
+	default:
+		return ColField
+	}
+}
+
+func (t *TableMeta) setColumn(id uint32, name string, kind ColumnKind) {
+	if t.Columns == nil {
+		t.Columns = map[uint32]CatColumn{}
+	}
+	t.Columns[id] = CatColumn{Name: name, Kind: kind}
 }
 
 // LoadCatalog detects the catalog era under the given node/store prefix and
@@ -233,62 +270,97 @@ func (c *Catalog) applyCheckpoint(payload []byte, what string) error {
 		}
 		for _, tp := range tables.Repo {
 			t := tp.Val
-			key, err := seriesKeyNames(t.Key, t.Columns)
+			cols, tagIDs, err := parseColumns(t.Columns)
+			if err != nil {
+				return fmt.Errorf("parse columns of table %d (%s) in %s: %w", t.TableID, t.TableName, what, err)
+			}
+			key, err := seriesKeyNames(t.Key, tagIDs)
 			if err != nil {
 				return fmt.Errorf("resolve series key of table %d (%s) in %s: %w", t.TableID, t.TableName, what, err)
 			}
-			db.Tables[t.TableID] = &TableMeta{ID: t.TableID, Name: t.TableName, Deleted: t.Deleted, SeriesKey: key}
+			db.Tables[t.TableID] = &TableMeta{ID: t.TableID, Name: t.TableName, Deleted: t.Deleted, SeriesKey: key, Columns: cols}
 		}
 		c.Databases[db.ID] = db
 	}
 	return nil
 }
 
-// seriesKeyNames resolves a checkpoint table's key ids to column names.
-// The columns repo has two era shapes, distinguished by element form:
+// parseColumns reads a checkpoint table's columns repo, which has two era
+// shapes distinguished by element form:
 //
 //	3.0-3.3 (idb3.002/003.s): repo is [[column_id, {name, id, influx_type,...}]]
-//	  pairs, and key holds COLUMN ids.
+//	  pairs; the series key holds COLUMN ids.
 //	3.4-3.9 (idb3.004.s): repo is a plain array of externally tagged enums
-//	  ({"tag":{id, column_id, name}} / {"field":...} / {"timestamp":...}),
-//	  and key holds TAG ids matching tag.id.
-func seriesKeyNames(key []uint32, columnsRaw json.RawMessage) ([]string, error) {
-	if len(key) == 0 {
-		return nil, nil
+//	  ({"tag":{id, column_id, name}} / {"field":...} / {"timestamp":...});
+//	  the series key holds TAG ids matching tag.id.
+//
+// It returns the full column-id map plus the id space the series key indexes
+// (column ids for the pair era, tag ids for the enum era).
+func parseColumns(columnsRaw json.RawMessage) (cols map[uint32]CatColumn, keyIDs map[uint32]string, err error) {
+	cols = map[uint32]CatColumn{}
+	keyIDs = map[uint32]string{}
+	if len(columnsRaw) == 0 {
+		return cols, keyIDs, nil
 	}
 	var wrapper struct {
 		Repo []json.RawMessage `json:"repo"`
 	}
 	if err := json.Unmarshal(columnsRaw, &wrapper); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	idToName := map[uint32]string{}
 	for _, el := range wrapper.Repo {
 		trimmed := bytes.TrimLeft(el, " \t\r\n")
 		if len(trimmed) > 0 && trimmed[0] == '[' {
 			var p pair[uint32, struct {
-				Name string `json:"name"`
+				Name       string `json:"name"`
+				InfluxType string `json:"influx_type"`
 			}]
 			if err := json.Unmarshal(el, &p); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			idToName[p.Key] = p.Val.Name
+			kind := ColField
+			switch p.Val.InfluxType {
+			case "tag":
+				kind = ColTag
+				keyIDs[p.Key] = p.Val.Name
+			case "time":
+				kind = ColTime
+			}
+			cols[p.Key] = CatColumn{Name: p.Val.Name, Kind: kind}
 		} else {
 			var enum map[string]struct {
-				ID   uint32 `json:"id"`
-				Name string `json:"name"`
+				ID       uint32 `json:"id"`
+				ColumnID uint32 `json:"column_id"`
+				Name     string `json:"name"`
 			}
 			if err := json.Unmarshal(el, &enum); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			if tag, ok := enum["tag"]; ok {
-				idToName[tag.ID] = tag.Name
+			for variant, c := range enum {
+				switch variant {
+				case "tag":
+					cols[c.ColumnID] = CatColumn{Name: c.Name, Kind: ColTag}
+					keyIDs[c.ID] = c.Name
+				case "timestamp":
+					cols[c.ColumnID] = CatColumn{Name: c.Name, Kind: ColTime}
+				case "field":
+					cols[c.ColumnID] = CatColumn{Name: c.Name, Kind: ColField}
+				}
 			}
 		}
 	}
+	return cols, keyIDs, nil
+}
+
+// seriesKeyNames resolves a checkpoint table's key ids against the id space
+// parseColumns identified for the era.
+func seriesKeyNames(key []uint32, keyIDs map[uint32]string) ([]string, error) {
+	if len(key) == 0 {
+		return nil, nil
+	}
 	names := make([]string, len(key))
 	for i, id := range key {
-		name, ok := idToName[id]
+		name, ok := keyIDs[id]
 		if !ok {
 			return nil, fmt.Errorf("series key references unknown column/tag id %d", id)
 		}
@@ -385,6 +457,9 @@ func (c *Catalog) applyOp(name string, body json.RawMessage, unknown map[string]
 		idToName := map[uint32]string{}
 		for _, fd := range op.FieldDefinitions {
 			idToName[fd.ID] = fd.Name
+			var dt string
+			_ = json.Unmarshal(fd.DataType, &dt)
+			t.setColumn(fd.ID, fd.Name, kindFromDataType(dt))
 		}
 		for _, k := range op.Key {
 			var id uint32
@@ -409,6 +484,7 @@ func (c *Catalog) applyOp(name string, body json.RawMessage, unknown map[string]
 			TableID          uint32 `json:"table_id"`
 			FieldDefinitions []struct {
 				Name     string          `json:"name"`
+				ID       uint32          `json:"id"`
 				DataType json.RawMessage `json:"data_type"`
 			} `json:"field_definitions"`
 		}
@@ -421,7 +497,9 @@ func (c *Catalog) applyOp(name string, body json.RawMessage, unknown map[string]
 		}
 		for _, fd := range op.FieldDefinitions {
 			var dt string
-			if json.Unmarshal(fd.DataType, &dt) == nil && dt == "Tag" {
+			_ = json.Unmarshal(fd.DataType, &dt)
+			t.setColumn(fd.ID, fd.Name, kindFromDataType(dt))
+			if dt == "Tag" {
 				t.appendSeriesKey(fd.Name)
 			}
 		}
@@ -441,13 +519,22 @@ func (c *Catalog) applyOp(name string, body json.RawMessage, unknown map[string]
 		}
 		for _, cd := range op.ColumnDefinitions {
 			var enum map[string]struct {
-				Name string `json:"name"`
+				Name     string `json:"name"`
+				ColumnID uint32 `json:"column_id"`
 			}
 			if err := json.Unmarshal(cd, &enum); err != nil {
 				return err
 			}
-			if tag, ok := enum["tag"]; ok {
-				t.appendSeriesKey(tag.Name)
+			for variant, col := range enum {
+				switch variant {
+				case "tag":
+					t.setColumn(col.ColumnID, col.Name, ColTag)
+					t.appendSeriesKey(col.Name)
+				case "timestamp":
+					t.setColumn(col.ColumnID, col.Name, ColTime)
+				case "field":
+					t.setColumn(col.ColumnID, col.Name, ColField)
+				}
 			}
 		}
 
