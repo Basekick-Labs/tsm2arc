@@ -1,0 +1,24 @@
+[package]
+name = "waldecoder"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Decodes InfluxDB 3 WAL payloads (bitcode serde-mode) to JSON on stdout.
+# The struct graph is vendored from influxdata/influxdb's influxdb3_wal crate;
+# it is IDENTICAL across every release tag v3.0.0..v3.11.4 (verified against
+# the upstream source at 23 tags), so one decoder covers all versions.
+# bitcode 0.6.9 matches the newest servers' Cargo.lock (older servers used
+# 0.6.3/0.6.6; 0.6.x is wire-compatible, and the Go test suite decodes real
+# WAL files written by 3.0.3, 3.4.2, and 3.11.2 servers as proof).
+
+[dependencies]
+bitcode = { version = "=0.6.9", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
