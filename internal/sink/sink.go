@@ -27,6 +27,8 @@ import (
 	"time"
 )
 
+const maxImportResponseBody = 1 << 20
+
 // Sink posts LP chunks to one Arc cluster.
 type Sink struct {
 	baseURL   string
@@ -210,14 +212,26 @@ func (s *Sink) doOnce(ctx context.Context, url, db, contentType string, body []b
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	respBody, readErr := io.ReadAll(io.LimitReader(resp.Body, maxImportResponseBody+1))
 
 	switch {
 	case resp.StatusCode == http.StatusOK:
+		// The import may already be durable even when its acknowledgement is
+		// unreadable. Never retry this outcome automatically: doing so could
+		// duplicate a chunk. Returning an error keeps the caller from committing
+		// its checkpoint so the operator can reconcile the chunk explicitly.
+		if readErr != nil {
+			return Result{}, false, fmt.Errorf("ambiguous acknowledgement: could not read HTTP 200 response; write outcome unknown: %w", readErr)
+		}
+		if len(respBody) > maxImportResponseBody {
+			return Result{}, false, fmt.Errorf("ambiguous acknowledgement: HTTP 200 response exceeds %d bytes; write outcome unknown", maxImportResponseBody)
+		}
 		var r Result
 		if err := json.Unmarshal(respBody, &r); err != nil {
-			// 200 but unparseable body — treat as success with empty result
-			return Result{Status: "ok"}, false, nil
+			return Result{}, false, fmt.Errorf("ambiguous acknowledgement: invalid HTTP 200 JSON response; write outcome unknown: %w", err)
+		}
+		if r.Status != "ok" {
+			return Result{}, false, fmt.Errorf("ambiguous acknowledgement: HTTP 200 response has status %q, want %q; write outcome unknown", r.Status, "ok")
 		}
 		return r, false, nil
 	case resp.StatusCode == http.StatusTooManyRequests:
