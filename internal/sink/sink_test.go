@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -78,6 +79,43 @@ func TestSinkSendSuccess(t *testing.T) {
 	}
 	if res.Result.RowsImported != 2 {
 		t.Errorf("rows imported %d want 2", res.Result.RowsImported)
+	}
+}
+
+func TestSinkAmbiguousSuccessResponseDoesNotRetry(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty body", body: ""},
+		{name: "malformed JSON", body: `{"status":`},
+		{name: "oversized body", body: `{"status":"ok"}` + strings.Repeat(" ", maxImportResponseBody)},
+		{name: "missing success status", body: `{"result":{"rows_imported":1}}`},
+		{name: "unexpected status", body: `{"status":"error"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&calls, 1)
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer srv.Close()
+
+			s := New(srv.URL, "test-token", "ns", WithRetry(5, time.Millisecond, 10*time.Millisecond))
+			_, err := s.Send(context.Background(), "db", []byte("m v=1 1\n"))
+			if err == nil {
+				t.Fatal("expected ambiguous acknowledgement error")
+			}
+			if !strings.Contains(err.Error(), "ambiguous acknowledgement") || !strings.Contains(err.Error(), "write outcome unknown") {
+				t.Fatalf("error does not explain ambiguous write outcome: %v", err)
+			}
+			if got := atomic.LoadInt32(&calls); got != 1 {
+				t.Fatalf("ambiguous acknowledgement must not be retried; got %d requests", got)
+			}
+		})
 	}
 }
 
