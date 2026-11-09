@@ -88,6 +88,9 @@ func parseByteSize(s string) (int64, error) {
 	if n < 0 {
 		return 0, fmt.Errorf("size must be non-negative")
 	}
+	if n > int64(^uint64(0)>>1)/mult {
+		return 0, fmt.Errorf("size %q overflows int64 bytes", strings.TrimSpace(s))
+	}
 	return n * mult, nil
 }
 

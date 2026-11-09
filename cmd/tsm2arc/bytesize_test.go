@@ -35,7 +35,7 @@ func TestParseByteSize(t *testing.T) {
 		}
 	}
 
-	bad := []string{"", "abc", "4zz", "10XB", "-5MB", "1.5MB"}
+	bad := []string{"", "abc", "4zz", "10XB", "-5MB", "1.5MB", "9223372036854775807K", "9223372036854775808"}
 	for _, in := range bad {
 		if _, err := parseByteSize(in); err == nil {
 			t.Errorf("parseByteSize(%q) should have errored", in)
