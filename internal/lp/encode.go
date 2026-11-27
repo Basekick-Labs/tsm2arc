@@ -157,3 +157,67 @@ func replacer(s string, pairs ...string) string {
 	}
 	return strings.NewReplacer(pairs...).Replace(s)
 }
+
+// Narrow layout: one line per field, the field's name as a tag and its value
+// in a column chosen by type. A very wide measurement whose fields are mostly
+// absent on a line (many sparse fields written at their own rates) stores in
+// Arc as dense columns, so it would pad every row to all of its fields; in
+// the narrow layout each line holds one value and nothing is padded.
+const (
+	NarrowValueFloat    = "value"
+	NarrowValueInteger  = "value_int"
+	NarrowValueUnsigned = "value_uint"
+	NarrowValueBoolean  = "value_bool"
+	NarrowValueString   = "value_str"
+)
+
+// NarrowValueColumns lists every value column the narrow layout writes.
+var NarrowValueColumns = []string{NarrowValueFloat, NarrowValueInteger, NarrowValueUnsigned, NarrowValueBoolean, NarrowValueString}
+
+// NarrowValueColumn is the value column for a field of block type t.
+func NarrowValueColumn(t byte) string {
+	switch t {
+	case tsm.BlockInteger:
+		return NarrowValueInteger
+	case tsm.BlockUnsigned:
+		return NarrowValueUnsigned
+	case tsm.BlockBoolean:
+		return NarrowValueBoolean
+	case tsm.BlockString:
+		return NarrowValueString
+	}
+	return NarrowValueFloat
+}
+
+// AppendNarrow appends one line per field of a point in the narrow layout:
+//
+//	measurement[,tagk=tagv...],<narrowTag>=<field name> <value column>=value timestamp
+//
+// All of a point's lines are appended together, so a caller that hands the
+// result to the chunk accumulator in one Append keeps a point whole within a
+// chunk (and so within one resume step).
+func AppendNarrow(dst []byte, measurement string, tags [][2]string, narrowTag string, fields []Field, unixNano int64) []byte {
+	m := escapeMeasurement(measurement)
+	nt := escapeTag(narrowTag)
+	for _, f := range fields {
+		dst = append(dst, m...)
+		for _, t := range tags {
+			dst = append(dst, ',')
+			dst = append(dst, escapeTag(t[0])...)
+			dst = append(dst, '=')
+			dst = append(dst, escapeTag(t[1])...)
+		}
+		dst = append(dst, ',')
+		dst = append(dst, nt...)
+		dst = append(dst, '=')
+		dst = append(dst, escapeTag(f.Name)...)
+		dst = append(dst, ' ')
+		dst = append(dst, NarrowValueColumn(f.Value.Type)...)
+		dst = append(dst, '=')
+		dst = appendFieldValue(dst, f.Value)
+		dst = append(dst, ' ')
+		dst = strconv.AppendInt(dst, unixNano, 10)
+		dst = append(dst, '\n')
+	}
+	return dst
+}

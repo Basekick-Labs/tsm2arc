@@ -337,6 +337,55 @@ change them mid-migration (tsm2arc refuses if you do — see §6).
 
 ---
 
+## 3b. Very wide, sparse measurements (`--narrow`)
+
+Arc stores a measurement as dense columns: every row has a cell, filled or
+empty, for every field the measurement has. Data written field by field at
+each field's own rate (a few fields per timestamp out of hundreds or
+thousands) is mostly empty cells in that form. Arc refuses an import whose
+empty cells outnumber its values more than 8 to 1 in a 4 MiB piece of the
+request (`413 ... too many empty cells`), and a measurement of thousands of
+columns is also hard for Arc to compact and query.
+
+Look for it before loading: on the source, `SHOW FIELD KEYS FROM <measurement>`
+lists a measurement's fields. If a measurement has more than a few hundred
+fields and a typical line carries only a small share of them (the dry run's
+`--sample` lines show how many a line has), load it narrow:
+
+```bash
+tsm2arc --datadir <...> --arc-url <...> --narrow table_w,table_x
+```
+
+Each point becomes one line per field. A point `table_w a=1.5,b=7i 1700000000000000000`
+is sent as:
+
+```text
+table_w,field=a value=1.5 1700000000000000000
+table_w,field=b value_int=7i 1700000000000000000
+```
+
+- Names are **source** measurement names, as `--analyze` shows them (before
+  `--measurement-map`). The pre-flight check refuses, before anything is
+  sent, a name that matches no measurement, a measurement with a tag the
+  narrow layout cannot write next to (the narrow tag, or a value column's
+  name in any letter case: pick another `--narrow-tag`), and an Arc
+  measurement that would get both a narrow and a wide source.
+- Value columns by type: float `value`, integer `value_int`, unsigned
+  `value_uint`, boolean `value_bool`, string `value_str`.
+- Query it by field: `SELECT time, value FROM db.table_w WHERE field = 'a'`;
+  pivot the few fields a query needs with `PIVOT` or `max(CASE ...)`.
+- `--narrow` and `--narrow-tag` are part of the checkpoint's fingerprint:
+  a run cannot be resumed with them added, removed or changed.
+- Row counts: Arc holds one row per field value for a narrow measurement, not
+  one per point (see §7).
+
+**Switching a measurement that was already partly loaded wide**: start a
+new checkpoint (`--checkpoint` to a new file), and drop what the wide run
+already wrote to Arc for that measurement first (or load the narrow form
+under another name with `--measurement-map`). A table cannot hold both
+layouts, and leftover wide columns such as a field named `value` with another
+type would make Arc refuse the narrow rows.
+
 ## 4. Size `--workers` against the Arc node
 
 `--workers N` migrates N shards concurrently (default 2). **The binding
@@ -556,6 +605,11 @@ curl -s -X POST "https://arc.example.net/api/v1/query" \
   -d "{\"sql\": \"SELECT count(*) FROM <database>.<measurement> WHERE time >= '<start>' AND time <= '<end>'\"}"
 ```
 
+- **Narrow** measurements (`--narrow`): Arc holds one row per field value,
+  so compare Arc's `count(*)` with the source's field-value count, not its
+  point count. The dry run reports both per database; scope it to the
+  narrow measurement's database (and window) to compare. The run's
+  "imported N rows" counts these rows too.
 - **Tag-bearing** data: after Arc compaction runs, counts should match exactly.
 - **Tagless** data: a small positive delta on Arc's side = resume-overlap
   duplicates (bounded to ≤1 chunk per shard per crash, per §6); a clean,

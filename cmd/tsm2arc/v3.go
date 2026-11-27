@@ -488,7 +488,7 @@ func (s *v3Source) forEachPoint(cfg runConfig, sh discover.Shard, cur *extract.C
 			fmt.Printf("WARN: "+format+"\n", args...)
 		}
 	}
-	st, err := extract3.Extract(s.fs, tbl, cfg.start, cfg.end, cur, extract3.Options{Warn: warn}, onPoint)
+	st, err := extract3.Extract(s.fs, tbl, cfg.start, cfg.end, cur, extract3.Options{Warn: warn, Ctx: cfg.split.Ctx}, onPoint)
 	if err != nil {
 		return err
 	}

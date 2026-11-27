@@ -135,6 +135,8 @@ func main() {
 		mMapArg      multiFlag
 		v3DBArg      multiFlag
 		v3TableArg   multiFlag
+		narrowArg    multiFlag
+		narrowTag    = flag.String("narrow-tag", defaultNarrowTag, "with --narrow: the tag that holds a field's name")
 	)
 	// chunk-bytes accepts a byte count or a size suffix (e.g. 450MB); default is
 	// DefaultMaxBytes (450 MiB).
@@ -148,12 +150,23 @@ func main() {
 	flag.Var(&dbMapArg, "db-map", "rename source DB/bucket to Arc DB, form old=new (repeatable)")
 	flag.Var(&mMapArg, "measurement-map", "rename a source measurement, form old=new; new must satisfy Arc's name rule (repeatable)")
 	flag.Var(&v3DBArg, "v3-db", "InfluxDB 3 sources: override a database id's name, form db_id=name (repeatable; the catalog resolves names automatically, including binary 3.10+ catalogs)")
+	flag.Var(&narrowArg, "narrow", "write these SOURCE measurements (comma-separated, repeatable) in the narrow layout: one line per field, the field's name as a tag (--narrow-tag) and its value in value / value_int / value_uint / value_bool / value_str. For very wide measurements whose fields are mostly absent on a line: Arc stores columns densely, so the wide form pads every row to all of them")
 	flag.Var(&v3TableArg, "v3-table", "InfluxDB 3 sources: override a table's name and series key, form db_id/table_id=name:tag1,tag2,... with tags in FIRST-WRITE order (repeatable; ':' with no tags for a tagless table; the catalog resolves these automatically)")
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("tsm2arc %s (commit %s, built %s)\n", version, commit, date)
 		return
+	}
+	narrowTagSet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "narrow-tag" {
+			narrowTagSet = true
+		}
+	})
+	narrow, err := parseNarrow(narrowArg, *narrowTag, narrowTagSet)
+	if err != nil {
+		fatal("%v", err)
 	}
 
 	if *datadir == "" {
@@ -431,6 +444,7 @@ func main() {
 		jsonOut:     *formatFlag == "json",
 		stallWarn:   effStallWarn,
 		v3:          v3src,
+		narrow:      narrow,
 	}
 
 	if *analyze {
@@ -490,6 +504,11 @@ func configFingerprint(cfg runConfig, precision string) string {
 	if cfg.v3 != nil {
 		fp += ";v3liveset=" + cfg.v3.fingerprint()
 	}
+	// Narrow changes the lines a chunk holds: only when set, so checkpoints of
+	// runs without it still resume, and adding or changing it is refused.
+	if nfp := cfg.narrow.fingerprint(); nfp != "" {
+		fp += ";" + nfp
+	}
 	return fp
 }
 
@@ -512,6 +531,7 @@ type runConfig struct {
 	jsonOut     bool // --analyze: emit the report as JSON on a pure stdout
 	stallWarn   time.Duration
 	v3          *v3Source // non-nil for InfluxDB 3 sources: replaces TSM extraction in forEachPoint
+	narrow      narrowConfig
 }
 
 func (c runConfig) arcDB(sourceDB string) string {

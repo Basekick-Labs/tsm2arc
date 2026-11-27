@@ -14,7 +14,6 @@ import (
 	"github.com/basekick-labs/tsm2arc/internal/chunk"
 	"github.com/basekick-labs/tsm2arc/internal/discover"
 	"github.com/basekick-labs/tsm2arc/internal/extract"
-	"github.com/basekick-labs/tsm2arc/internal/lp"
 	"github.com/basekick-labs/tsm2arc/internal/measure"
 	"github.com/basekick-labs/tsm2arc/internal/sink"
 	"github.com/basekick-labs/tsm2arc/internal/tsm"
@@ -45,6 +44,7 @@ func runDryRun(ctx context.Context, cfg runConfig, sampleN int) {
 		aggs[db] = ag
 		for _, sh := range byDB[db] {
 			forEachPoint(cfg, sh, nil, func(p extract.Point) {
+				src := p.Measurement
 				res := cfg.resolver.Resolve(p.Measurement)
 				if res.Action != measure.ActionPass {
 					ag.actions[p.Measurement] = res
@@ -52,9 +52,16 @@ func runDryRun(ctx context.Context, cfg runConfig, sampleN int) {
 				}
 				// Samples show what a load would SEND: renamed lines under their
 				// final name; skipped/invalid measurements never sampled.
+				// Encoded as the load encodes them: a --narrow point is several
+				// lines, of which the samples keep as many as fit.
 				if len(ag.samples) < sampleN && res.Name != "" {
 					p.Measurement = res.Name
-					ag.samples = append(ag.samples, strings.TrimRight(extract.EncodePoint(p), "\n"))
+					for _, line := range strings.Split(strings.TrimRight(string(encodePoint(nil, cfg, src, p)), "\n"), "\n") {
+						if len(ag.samples) >= sampleN {
+							break
+						}
+						ag.samples = append(ag.samples, line)
+					}
 				}
 			}, func(st extract.Stats) {
 				ag.points += int64(st.Points)
@@ -269,6 +276,9 @@ type shardResult struct {
 	rows, sent, skipped int64
 	skippedPoints       int64
 	alreadyDone         bool
+	// extracted counts every point extraction delivered, including those
+	// after a failure: how far a shard ran on once it could no longer send.
+	extracted int64
 }
 
 // loadShard migrates one shard, resuming past any previously committed chunks.
@@ -300,6 +310,12 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 	cpKey := sh.SourceID
 	label := sh.Database
 	actKey := label + "/" + sh.ShardID
+
+	// A shard queued behind one that failed must not start (errgroup still
+	// runs the queued goroutines after it cancels).
+	if err := ctx.Err(); err != nil {
+		return r, err
+	}
 
 	done, err := cp.IsShardDone(cpKey, sh.ShardID)
 	if err != nil {
@@ -333,11 +349,22 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 			label, sh.ShardID, committed, committed+1)
 	}
 
+	// shardCtx stops this shard's EXTRACTION as soon as anything fails: a
+	// rejected chunk (the sender cancels it on its first error), a point the
+	// shard cannot send, or another shard's failure (it derives from ctx).
+	// POSTs keep ctx, not shardCtx: a local failure must not cancel chunks
+	// already in flight, which Arc may store while this run never commits
+	// them, so a resume would send them again.
+	shardCtx, cancelShard := context.WithCancel(ctx)
+	defer cancelShard()
+	cfg.split.Ctx = shardCtx
+
 	var snd *sender
 	snd = newSender(ctx, senderConfig{
 		pipelined: cfg.pipeline,
 		inflight:  cfg.inflight,
 		firstSeq:  committed + 1,
+		onErr:     cancelShard,
 		post: func(ctx context.Context, j sendJob) (sink.Result, error) {
 			sres, err := snk.Send(ctx, arcDB, j.lp)
 			if err != nil {
@@ -427,7 +454,14 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 	scratch := make([]byte, 0, 64<<10) // reused per-line encode buffer
 	var appendErr error
 	extractErr := forEachPoint(cfg, sh, resumeCur, func(p extract.Point) {
+		r.extracted++
 		if appendErr != nil {
+			return
+		}
+		srcMeasurement := p.Measurement // --narrow matches source names
+		if err := narrowPointError(cfg, srcMeasurement, p); err != nil {
+			appendErr = err
+			cancelShard()
 			return
 		}
 		res, ok := resCache[p.Measurement]
@@ -446,6 +480,7 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 		switch res.Action {
 		case measure.ActionInvalid:
 			appendErr = errInvalidMeasurement(p.Measurement)
+			cancelShard()
 			return
 		case measure.ActionSkipped:
 			bump(p.Measurement)
@@ -455,15 +490,33 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 			bump(p.Measurement)
 			p.Measurement = res.Name
 		}
-		scratch = lp.AppendPoint(scratch[:0], p.Measurement, p.Tags, p.Fields, p.UnixNano)
+		scratch = encodePoint(scratch[:0], cfg, srcMeasurement, p)
 		appendErr = acc.Append(ctx, scratch, chunk.Marker{SeriesKey: p.SeriesKey, UnixNano: p.UnixNano, Tally: tally})
+		if appendErr != nil {
+			cancelShard()
+		}
 		tallyShared = true
 	}, nil, prog)
+	// Which error explains the stop, in order: what this shard could not
+	// send; what the sender saw (a rejected chunk, which cancelled the
+	// extraction, whose own error is then only "context canceled"); then the
+	// extraction's.
 	if appendErr != nil {
 		return r, fmt.Errorf("load %s/%s: %w", label, sh.ShardID, appendErr)
 	}
 	if extractErr != nil {
+		if sendErr := snd.wait(); sendErr != nil {
+			return r, sendErr
+		}
 		return r, fmt.Errorf("load %s/%s: %w", label, sh.ShardID, extractErr)
+	}
+	// A shard whose extraction was cancelled is never flushed or marked done,
+	// even when the extraction itself did not report it.
+	if err := shardCtx.Err(); err != nil {
+		if sendErr := snd.wait(); sendErr != nil {
+			return r, sendErr
+		}
+		return r, fmt.Errorf("load %s/%s: %w", label, sh.ShardID, err)
 	}
 	if err := acc.Flush(ctx); err != nil {
 		return r, fmt.Errorf("final flush %s/%s: %w", label, sh.ShardID, err)
@@ -474,6 +527,9 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 	// shard here; its progress up to the failure is already checkpointed.
 	if err := snd.wait(); err != nil {
 		return r, err
+	}
+	if err := shardCtx.Err(); err != nil {
+		return r, fmt.Errorf("load %s/%s: %w", label, sh.ShardID, err)
 	}
 	r.sent, r.rows = snd.sent, snd.rows
 
@@ -503,6 +559,10 @@ type senderConfig struct {
 	firstSeq  int // seq of the first chunk this run will submit (committed+1)
 	post      func(context.Context, sendJob) (sink.Result, error)
 	commit    func(context.Context, sendJob, sink.Result) error
+	// onErr, when set, is called once, on the first error: the shard stops
+	// extracting at once instead of at its next chunk (up to --chunk-bytes
+	// of extraction later, or never if the shard ends first).
+	onErr func()
 }
 
 // sendResult carries one finished POST — success or failure — to the
@@ -674,10 +734,14 @@ func (s *sender) wait() error {
 
 func (s *sender) setErr(err error) {
 	s.mu.Lock()
-	if s.err == nil {
+	first := s.err == nil
+	if first {
 		s.err = err
 	}
 	s.mu.Unlock()
+	if first && s.cfg.onErr != nil {
+		s.cfg.onErr()
+	}
 }
 
 func (s *sender) takeErr() error {

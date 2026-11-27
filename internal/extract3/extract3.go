@@ -29,6 +29,7 @@
 package extract3
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"path"
@@ -81,6 +82,17 @@ type Options struct {
 	// Warn receives non-fatal diagnostics (bucket-overlap fallback). Nil
 	// discards them.
 	Warn func(format string, args ...any)
+	// Ctx, when set, stops extraction between buckets and every 1024 rows;
+	// Extract then returns its error, never nil, so a partly read table is
+	// not taken for a complete one. Nil means context.Background().
+	Ctx context.Context
+}
+
+func (o Options) ctxOf() context.Context {
+	if o.Ctx != nil {
+		return o.Ctx
+	}
+	return context.Background()
 }
 
 func (o Options) warnf(format string, args ...any) {
@@ -136,7 +148,11 @@ func Extract(f vfs.FS, tbl Table, start, end int64, cur *extract.Cursor, opt Opt
 	}
 
 	var prevSeries string
+	ctx := opt.ctxOf()
 	for _, b := range buckets {
+		if err := ctx.Err(); err != nil {
+			return st, err
+		}
 		prefix := bucketPrefix(b.chunkTime)
 		if cur != nil && prefix < curBucketPrefix {
 			continue // entire bucket already emitted
@@ -159,6 +175,11 @@ func Extract(f vfs.FS, tbl Table, start, end int64, cur *extract.Cursor, opt Opt
 			return st, err
 		}
 		for i := range rows {
+			if i%1024 == 1023 {
+				if err := ctx.Err(); err != nil {
+					return st, err
+				}
+			}
 			r := &rows[i]
 			// Rows sort by (series, time, file rank ascending), so within a
 			// duplicate group the LAST row is the LWW winner: skip the rest.

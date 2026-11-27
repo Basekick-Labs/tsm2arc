@@ -76,8 +76,9 @@ func NewAt(maxBytes, startSeq int, flush FlushFunc) *Accumulator {
 	}
 }
 
-// Append adds one already-encoded LP line (which MUST include its trailing
-// newline) annotated with its marker. If adding it would exceed maxBytes, the
+// Append adds one already-encoded point, annotated with its marker: one LP
+// line, or (--narrow) all of the point's lines, kept together so a chunk and
+// a resume step never split a point. It MUST end with a newline. If adding it would exceed maxBytes, the
 // current buffer is flushed first — that flush carries the marker of the
 // previously appended line, which is the last line of the flushed chunk — then
 // the line starts a new chunk. A single line larger than maxBytes is flushed on

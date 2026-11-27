@@ -9,6 +9,7 @@
 package extract
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -408,7 +409,7 @@ func (c *collector) add(rawKey string, vals []tsm.Value) {
 func (c *collector) emit(fn func(Point)) (Stats, error) {
 	sort.Slice(c.groups, func(i, j int) bool { return c.groups[i].seriesKey < c.groups[j].seriesKey })
 	for _, g := range c.groups {
-		if err := mergeSeries(g.seriesKey, g.measurement, g.tags, g.streams, &c.stats, fn); err != nil {
+		if err := mergeSeries(context.Background(), g.seriesKey, g.measurement, g.tags, g.streams, &c.stats, fn); err != nil {
 			return c.stats, err
 		}
 	}
@@ -531,7 +532,27 @@ type SplitOptions struct {
 	// one decoded block per (file × field). A task whose estimate exceeds the
 	// whole budget runs alone, degrading to the serial memory profile.
 	MemoryBudget int64
+	// Ctx, when set, stops extraction: once it is done the shard returns its
+	// error instead of finishing, wherever extraction is (index pass, merge,
+	// split scheduler). A cancelled extraction never returns a nil error, so
+	// a caller cannot mistake a partly read shard for a complete one. Nil
+	// means context.Background(). Not part of the output: like Workers it
+	// leaves the bytes emitted before the cancel unchanged.
+	Ctx context.Context
 }
+
+// ctxOf is opt.Ctx, or Background when unset.
+func (opt SplitOptions) ctxOf() context.Context {
+	if opt.Ctx != nil {
+		return opt.Ctx
+	}
+	return context.Background()
+}
+
+// cancelCheckEvery is how many points mergeSeries emits between checks of its
+// context: cheap enough to be free, frequent enough that a cancel stops a
+// single huge series within a fraction of a second.
+const cancelCheckEvery = 1024
 
 // shardIndex is the phase-1/2 product shared by the serial and split paths:
 // which series exist, which files hold them (with time ranges), and the WAL
@@ -552,13 +573,18 @@ type shardIndex struct {
 // each series we record which file indices hold its keys and the time range
 // they span — the range comes free from the block index and lets phase 3 avoid
 // holding files open whose data cannot interleave (see partitionRuns).
-func indexShard(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, st *Stats) (*shardIndex, error) {
+func indexShard(ctx context.Context, tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, st *Stats) (*shardIndex, error) {
 	si := &shardIndex{
 		keysBySeriesFile: map[string]map[int]*fileKeys{},
 		walBySeries:      map[string][]walStream{},
 	}
 	seen := map[string]struct{}{}
 	for fi, tf := range tsmFiles {
+		// The index pass alone can take minutes on a shard of hundreds of
+		// files: stop between files once the load has failed.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		r, err := openTSM(tf)
 		if err != nil {
 			return nil, err
@@ -653,7 +679,8 @@ func seriesStartFor(sk string, start int64, cur *Cursor) (int64, bool) {
 // is byte-identical across every SplitOptions value; see SplitOptions.
 func ShardResumeSplit(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALReader, start, end int64, cur *Cursor, opt SplitOptions, fn func(Point)) (Stats, error) {
 	var st Stats
-	si, err := indexShard(tsmFiles, walFiles, openTSM, readWAL, &st)
+	ctx := opt.ctxOf()
+	si, err := indexShard(ctx, tsmFiles, walFiles, openTSM, readWAL, &st)
 	if err != nil {
 		return st, err
 	}
@@ -674,6 +701,9 @@ func ShardResumeSplit(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALR
 
 	keysBySeriesFile, walBySeries := si.keysBySeriesFile, si.walBySeries
 	for _, sk := range si.seriesOrder {
+		if err := ctx.Err(); err != nil {
+			return st, err
+		}
 		// Within the cursor series, resume from the next timestamp; block pruning
 		// (pruneEntries / sliceStream filtering) then skips everything already
 		// delivered. Timestamps within a series are strictly ascending and unique,
@@ -716,7 +746,7 @@ func ShardResumeSplit(tsmFiles, walFiles []string, openTSM OpenTSM, readWAL WALR
 				streams = append(streams, newSliceStream(ws.field, ws.vals, seriesStart, end))
 			}
 
-			err := mergeSeries(sk, measurement, tags, streams, &st, fn)
+			err := mergeSeries(ctx, sk, measurement, tags, streams, &st, fn)
 			// Release every cursor — including ones the merge never reached — so
 			// the run's file handles and blocks are gone before the next starts.
 			for _, s := range streams {
@@ -831,10 +861,14 @@ func sortedIntKeys(m map[int]*fileKeys) []int {
 // fieldMergeStream yields equal-timestamp values in exactly that child order,
 // so coalescing preserves the winner byte for byte. Field order in the emitted
 // line is deterministic (streams sorted by field name).
-func mergeSeries(seriesKey, measurement string, tags [][2]string, streams []stream, st *Stats, fn func(Point)) error {
+func mergeSeries(ctx context.Context, seriesKey, measurement string, tags [][2]string, streams []stream, st *Stats, fn func(Point)) error {
 	if len(streams) == 0 {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	emitted := 0
 
 	// Collapse to one stream per field (preserving the original stream order
 	// within each field — that order IS the last-write-wins precedence).
@@ -905,6 +939,11 @@ func mergeSeries(seriesKey, measurement string, tags [][2]string, streams []stre
 		st.Points++
 		st.Fields += len(fieldBuf)
 		st.observe(minTS)
+		if emitted++; emitted%cancelCheckEvery == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		if fn != nil {
 			// fieldBuf is reused for the next timestamp: Fields is only valid
 			// during the callback (documented on Point). Not copying here removes
