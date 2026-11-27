@@ -29,6 +29,13 @@ import (
 func writeKeysShard(t *testing.T, db string, vals map[string]itsm.Values) string {
 	t.Helper()
 	root := t.TempDir()
+	writeKeysShardInto(t, root, db, vals)
+	return root
+}
+
+// writeKeysShardInto adds database db (shard 1) under root.
+func writeKeysShardInto(t *testing.T, root, db string, vals map[string]itsm.Values) {
+	t.Helper()
 	dir := filepath.Join(root, db, "autogen", "1")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
@@ -56,7 +63,6 @@ func writeKeysShard(t *testing.T, db string, vals map[string]itsm.Values) string
 	}
 	w.Close()
 	f.Close()
-	return root
 }
 
 // manySeries is n tagged series of one point each.
@@ -291,7 +297,6 @@ func TestNarrowCensus(t *testing.T) {
 		mapArg []string
 		want   string
 	}{
-		{"unknown name", map[string]itsm.Values{"wide#!~#a": {itsm.NewFloatValue(ts, 1)}}, []string{"wdie"}, nil, "no source measurement"},
 		{"narrow tag clash", map[string]itsm.Values{"wide,Field=x#!~#a": {itsm.NewFloatValue(ts, 1)}}, []string{"wide"}, nil, "clashes"},
 		{"value column clash", map[string]itsm.Values{"wide,value=x#!~#a": {itsm.NewFloatValue(ts, 1)}}, []string{"wide"}, nil, "clashes"},
 		{"mixed layouts in one table", map[string]itsm.Values{
@@ -368,5 +373,117 @@ func TestNarrowClashAtLoadStopsShard(t *testing.T) {
 	_, err := loadShard(context.Background(), cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp, shards[0], "metrics", newProgress(1, false, 0))
 	if err == nil || !strings.Contains(err.Error(), "narrow layout") {
 		t.Fatalf("err = %v, want the narrow clash", err)
+	}
+}
+
+// A --narrow name no measurement has is a warning, not a refusal: batched runs
+// share one list, and a misspelt name only leaves that measurement wide.
+func TestNarrowUnknownNameWarns(t *testing.T) {
+	ts := int64(1700000000) * 1e9
+	arc := &recordingArc{status: http.StatusOK}
+	srv := httptest.NewServer(http.HandlerFunc(arc.handler))
+	defer srv.Close()
+	narrow, _ := parseNarrow([]string{"wdie"}, "field", false)
+	resolver, _ := measure.NewResolver(nil, measure.PolicyFail)
+	cfg := runConfig{shards: testShards(t, writeKeysShard(t, "metrics", map[string]itsm.Values{"wide#!~#a": {itsm.NewFloatValue(ts, 1)}})),
+		start: math.MinInt64, end: math.MaxInt64, chunkSize: 1 << 20, pipeline: true, narrow: narrow, resolver: resolver}
+	cp, _ := checkpoint.Open(filepath.Join(t.TempDir(), "cp.db"))
+	defer cp.Close()
+	if _, err := load(context.Background(), cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp); err != nil {
+		t.Fatalf("an unknown --narrow name refused the load: %v", err)
+	}
+	if len(arc.lines) != 1 || !strings.HasPrefix(arc.lines[0], "wide a=1 ") {
+		t.Fatalf("sent %q, want the measurement wide", arc.lines)
+	}
+}
+
+// One Arc measurement name in two Arc databases is two tables: one narrow and
+// one wide is fine.
+func TestNarrowLayoutCheckedPerDatabase(t *testing.T) {
+	ts := int64(1700000000) * 1e9
+	root := t.TempDir()
+	writeKeysShardInto(t, root, "dbx", map[string]itsm.Values{"a#!~#f": {itsm.NewFloatValue(ts, 1)}})
+	writeKeysShardInto(t, root, "dby", map[string]itsm.Values{"b#!~#f": {itsm.NewFloatValue(ts, 1)}})
+	mmap := map[string]string{}
+	if err := measure.AddEntries(mmap, []string{"a=t", "b=t"}, "--measurement-map"); err != nil {
+		t.Fatal(err)
+	}
+	resolver, _ := measure.NewResolver(mmap, measure.PolicyFail)
+	narrow, _ := parseNarrow([]string{"a"}, "field", false)
+	cfg := runConfig{shards: testShards(t, root), start: math.MinInt64, end: math.MaxInt64, chunkSize: 1 << 20, narrow: narrow, resolver: resolver}
+	_, jobs := shardJobs(cfg)
+	if err := censusMeasurements(cfg, nil, jobs); err != nil {
+		t.Fatalf("one name in two databases refused: %v", err)
+	}
+}
+
+// The dry run runs the narrow pre-flight with no checkpoint (nil store).
+func TestNarrowCensusWithoutCheckpoint(t *testing.T) {
+	ts := int64(1700000000) * 1e9
+	narrow, _ := parseNarrow([]string{"wide"}, "field", false)
+	resolver, _ := measure.NewResolver(nil, measure.PolicyFail)
+	cfg := runConfig{shards: testShards(t, writeKeysShard(t, "metrics", map[string]itsm.Values{"wide,field=x#!~#a": {itsm.NewFloatValue(ts, 1)}})),
+		start: math.MinInt64, end: math.MaxInt64, chunkSize: 1 << 20, narrow: narrow, resolver: resolver}
+	_, jobs := shardJobs(cfg)
+	if err := censusMeasurements(cfg, nil, jobs); err == nil || !strings.Contains(err.Error(), "clashes") {
+		t.Fatalf("err = %v, want the clash", err)
+	}
+}
+
+// The sender stops the shard at the refusal itself, not at the shard's next
+// chunk: with chunks of about a third of the shard, extraction must not run
+// on into the second third.
+func TestRefusalStopsBeforeTheNextChunk(t *testing.T) {
+	const n = 6000
+	arc := &recordingArc{status: http.StatusRequestEntityTooLarge}
+	srv := httptest.NewServer(http.HandlerFunc(arc.handler))
+	defer srv.Close()
+	shards := testShards(t, writeKeysShard(t, "metrics", manySeries(n)))
+	cp, _ := checkpoint.Open(filepath.Join(t.TempDir(), "cp.db"))
+	defer cp.Close()
+	// A line is ~47 bytes ("cpu,host=node00001 usage=1 1700000001000000000"):
+	// a chunk of about n/3 lines.
+	cfg := runConfig{shards: shards, start: math.MinInt64, end: math.MaxInt64, chunkSize: 47 * n / 3, pipeline: true, inflight: 1}
+	r, err := loadShard(context.Background(), cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp, shards[0], "metrics", newProgress(1, false, 0))
+	if err == nil || !strings.Contains(err.Error(), "413") {
+		t.Fatalf("err = %v, want the 413", err)
+	}
+	// Stopped at the refusal: a little past the first chunk. Waiting for the
+	// next chunk to notice would run on to about 2n/3.
+	if r.extracted >= n/2 {
+		t.Fatalf("extraction reached point %d of %d: it waited for the next chunk to see the refusal", r.extracted, n)
+	}
+}
+
+// A run cancelled (another shard failed) as this shard reads its last point,
+// with its only chunk still in the accumulator: nothing more goes out and the
+// shard is not marked done, so a resume redoes it.
+func TestCancelAtTheEndOfExtractionIsNotDone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	arc := &recordingArc{status: http.StatusOK}
+	srv := httptest.NewServer(http.HandlerFunc(arc.handler))
+	defer srv.Close()
+	const n = 200
+	shards := testShards(t, writeKeysShard(t, "metrics", manySeries(n)))
+	cp, _ := checkpoint.Open(filepath.Join(t.TempDir(), "cp.db"))
+	defer cp.Close()
+	old := onShardPoint
+	t.Cleanup(func() { onShardPoint = old })
+	onShardPoint = func(extracted int64) {
+		if extracted == n {
+			cancel()
+		}
+	}
+	cfg := runConfig{shards: shards, start: math.MinInt64, end: math.MaxInt64, chunkSize: 1 << 20, pipeline: true}
+	r, err := loadShard(ctx, cfg, sink.New(srv.URL, "tok", "ns", fastRetry()), cp, shards[0], "metrics", newProgress(1, false, 0))
+	if err == nil {
+		t.Fatalf("finished without an error after %d points", r.extracted)
+	}
+	if done, _ := cp.IsShardDone("metrics", "1"); done {
+		t.Fatal("a shard cancelled before its final chunk went out was marked done")
+	}
+	if arc.requests != 0 {
+		t.Fatalf("%d chunks sent after the run was cancelled", arc.requests)
 	}
 }

@@ -448,6 +448,9 @@ func main() {
 	}
 
 	if *analyze {
+		if cfg.narrow.enabled() {
+			fmt.Fprintln(os.Stderr, "note: --narrow has no effect with --analyze (it shapes what a load sends)")
+		}
 		if cfg.v3 != nil {
 			runAnalyzeV3(cfg, *datadir)
 			return

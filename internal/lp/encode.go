@@ -197,19 +197,27 @@ func NarrowValueColumn(t byte) string {
 // result to the chunk accumulator in one Append keeps a point whole within a
 // chunk (and so within one resume step).
 func AppendNarrow(dst []byte, measurement string, tags [][2]string, narrowTag string, fields []Field, unixNano int64) []byte {
-	m := escapeMeasurement(measurement)
-	nt := escapeTag(narrowTag)
-	for _, f := range fields {
-		dst = append(dst, m...)
-		for _, t := range tags {
-			dst = append(dst, ',')
-			dst = append(dst, escapeTag(t[0])...)
-			dst = append(dst, '=')
-			dst = append(dst, escapeTag(t[1])...)
-		}
+	if len(fields) == 0 {
+		return dst
+	}
+	// The prefix (measurement, tags, "<narrowTag>=") is the same on every
+	// line of the point: encode it once, then copy it per field.
+	start := len(dst)
+	dst = append(dst, escapeMeasurement(measurement)...)
+	for _, t := range tags {
 		dst = append(dst, ',')
-		dst = append(dst, nt...)
+		dst = append(dst, escapeTag(t[0])...)
 		dst = append(dst, '=')
+		dst = append(dst, escapeTag(t[1])...)
+	}
+	dst = append(dst, ',')
+	dst = append(dst, escapeTag(narrowTag)...)
+	dst = append(dst, '=')
+	prefixEnd := len(dst)
+	for i, f := range fields {
+		if i > 0 {
+			dst = append(dst, dst[start:prefixEnd]...)
+		}
 		dst = append(dst, escapeTag(f.Name)...)
 		dst = append(dst, ' ')
 		dst = append(dst, NarrowValueColumn(f.Value.Type)...)

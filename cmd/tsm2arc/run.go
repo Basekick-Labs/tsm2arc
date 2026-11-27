@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sync/errgroup"
 
@@ -25,6 +26,14 @@ import (
 // reports what a load would do — the pre-flight answer to "which of my
 // measurement names would Arc reject, and what happens to them?".
 func runDryRun(ctx context.Context, cfg runConfig, sampleN int) {
+	// The dry run is the rehearsal: a --narrow the load would refuse is
+	// refused here too.
+	if cfg.narrow.enabled() {
+		_, jobs := shardJobs(cfg)
+		if err := censusMeasurements(cfg, nil, jobs); err != nil {
+			fatal("%v", err)
+		}
+	}
 	type dbAgg struct {
 		points, fields, keys, skipped int64
 		minT, maxT                    int64
@@ -209,10 +218,10 @@ type shardJob struct {
 // error the context is cancelled and in-flight shards stop; their partial
 // progress is already durably checkpointed (commit-after-2xx), so a later resume
 // continues correctly.
-func load(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoint.Store) (loadResult, error) {
+// shardJobs is the deterministic job list (DB order, then shard order), and
+// the source DB order.
+func shardJobs(cfg runConfig) ([]string, []shardJob) {
 	order, byDB := shardsByDB(cfg.shards)
-
-	// Flatten to a deterministic job list (DB order, then shard order).
 	var jobs []shardJob
 	for _, db := range order {
 		arcDB := cfg.arcDB(db)
@@ -220,6 +229,11 @@ func load(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoint.Sto
 			jobs = append(jobs, shardJob{shard: sh, arcDB: arcDB})
 		}
 	}
+	return order, jobs
+}
+
+func load(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoint.Store) (loadResult, error) {
+	order, jobs := shardJobs(cfg)
 
 	res := loadResult{Databases: len(order)}
 	results := make([]shardResult, len(jobs))
@@ -355,9 +369,17 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 	// POSTs keep ctx, not shardCtx: a local failure must not cancel chunks
 	// already in flight, which Arc may store while this run never commits
 	// them, so a resume would send them again.
-	shardCtx, cancelShard := context.WithCancel(ctx)
-	defer cancelShard()
+	shardCtx, cancelCtx := context.WithCancel(ctx)
+	defer cancelCtx()
 	cfg.split.Ctx = shardCtx
+	// stopped is read per point (an atomic load, unlike ctx.Err's lock): once
+	// set, points still in flight are dropped unexamined, so a later point
+	// cannot replace the first failure as the reported error.
+	var stopped atomic.Bool
+	cancelShard := func() {
+		stopped.Store(true)
+		cancelCtx()
+	}
 
 	var snd *sender
 	snd = newSender(ctx, senderConfig{
@@ -455,15 +477,11 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 	var appendErr error
 	extractErr := forEachPoint(cfg, sh, resumeCur, func(p extract.Point) {
 		r.extracted++
-		if appendErr != nil {
+		onShardPoint(r.extracted)
+		if appendErr != nil || stopped.Load() {
 			return
 		}
 		srcMeasurement := p.Measurement // --narrow matches source names
-		if err := narrowPointError(cfg, srcMeasurement, p); err != nil {
-			appendErr = err
-			cancelShard()
-			return
-		}
 		res, ok := resCache[p.Measurement]
 		if !ok {
 			res = cfg.resolver.Resolve(p.Measurement)
@@ -489,6 +507,13 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 		case measure.ActionRenamed, measure.ActionAutoRenamed:
 			bump(p.Measurement)
 			p.Measurement = res.Name
+		}
+		// Checked only for points that are sent: a skipped measurement in
+		// --narrow does not fail the shard.
+		if err := narrowPointError(cfg, srcMeasurement, p); err != nil {
+			appendErr = err
+			cancelShard()
+			return
 		}
 		scratch = encodePoint(scratch[:0], cfg, srcMeasurement, p)
 		appendErr = acc.Append(ctx, scratch, chunk.Marker{SeriesKey: p.SeriesKey, UnixNano: p.UnixNano, Tally: tally})
@@ -542,6 +567,10 @@ func loadShard(ctx context.Context, cfg runConfig, snk *sink.Sink, cp *checkpoin
 	prog.shardDone()
 	return r, nil
 }
+
+// onShardPoint is a test seam: called with the shard's running point count
+// for every point extraction delivers.
+var onShardPoint = func(int64) {}
 
 // sendJob is one finished chunk on its way to Arc: the raw LP, its sequence,
 // and the checkpoint state (cursor + audit deltas) to commit after the 2xx.

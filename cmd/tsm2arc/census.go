@@ -47,9 +47,14 @@ func censusMeasurements(cfg runConfig, cp *checkpoint.Store, jobs []shardJob) er
 		var bad []string
 		names := map[string]int{}
 		tags := map[string]map[string]bool{}
+		byDB := map[string]map[string]bool{}
 		for _, j := range jobs {
 			tbl := cfg.v3.tables[j.shard.SourceID+"/"+j.shard.ShardID]
 			names[tbl.Measurement]++
+			if byDB[j.arcDB] == nil {
+				byDB[j.arcDB] = map[string]bool{}
+			}
+			byDB[j.arcDB][tbl.Measurement] = true
 			if cfg.narrow.has(tbl.Measurement) {
 				set := tags[tbl.Measurement]
 				if set == nil {
@@ -70,13 +75,14 @@ func censusMeasurements(cfg runConfig, cp *checkpoint.Store, jobs []shardJob) er
 			sort.Strings(bad)
 			return censusFailure(bad, nil)
 		}
-		return checkNarrow(cfg, names, tags, false)
+		return checkNarrow(cfg, names, tags, byDB, false)
 	}
 	fmt.Printf("pre-flight: checking measurement names across %d shard(s) (index-only)\n", len(jobs))
 
 	var mu sync.Mutex
 	names := map[string]int{}            // measurement → shards containing it (in window)
 	tags := map[string]map[string]bool{} // --narrow measurement → its tag keys
+	byDB := map[string]map[string]bool{} // Arc database → source measurements it gets
 	resumed := false                     // a shard was skipped as done: its names are not counted
 
 	workers := cfg.workers
@@ -92,9 +98,13 @@ func censusMeasurements(cfg runConfig, cp *checkpoint.Store, jobs []shardJob) er
 			if err := gctx.Err(); err != nil {
 				return err
 			}
-			done, err := cp.IsShardDone(j.shard.SourceID, j.shard.ShardID)
-			if err != nil {
-				return fmt.Errorf("census checkpoint read (%s/%s): %w", j.shard.Database, j.shard.ShardID, err)
+			done := false
+			if cp != nil { // nil: a dry run, which has no checkpoint
+				var err error
+				done, err = cp.IsShardDone(j.shard.SourceID, j.shard.ShardID)
+				if err != nil {
+					return fmt.Errorf("census checkpoint read (%s/%s): %w", j.shard.Database, j.shard.ShardID, err)
+				}
 			}
 			if done {
 				mu.Lock()
@@ -162,8 +172,12 @@ func censusMeasurements(cfg runConfig, cp *checkpoint.Store, jobs []shardJob) er
 				}
 			}
 			mu.Lock()
+			if byDB[j.arcDB] == nil {
+				byDB[j.arcDB] = map[string]bool{}
+			}
 			for m := range local {
 				names[m]++
+				byDB[j.arcDB][m] = true
 			}
 			for m, set := range localTags {
 				all := tags[m]
@@ -198,20 +212,19 @@ func censusMeasurements(cfg runConfig, cp *checkpoint.Store, jobs []shardJob) er
 		}
 		fmt.Printf("pre-flight: %d measurement name(s), all valid or mapped\n", len(names))
 	}
-	return checkNarrow(cfg, names, tags, resumed)
+	return checkNarrow(cfg, names, tags, byDB, resumed)
 }
 
 // checkNarrow refuses, before the first POST, a --narrow that would fail or
 // mislead hours into a load:
-//   - a name that matches no source measurement (a typo, or the renamed Arc
-//     name instead of the source one), which would leave that measurement
-//     wide and bring back the 413s --narrow is for. On a resume the shards
-//     already done were not read, so there it is only a warning;
+//   - (a warning) a name that matches no source measurement: a typo, or the
+//     renamed Arc name instead of the source one;
 //   - a narrow measurement with a tag the narrow layout cannot write next to
 //     (the narrow tag, or a value column's name in any letter case);
-//   - an Arc measurement fed by both a narrow and a wide source measurement
-//     (--measurement-map): one table cannot hold both layouts.
-func checkNarrow(cfg runConfig, names map[string]int, tags map[string]map[string]bool, resumed bool) error {
+//   - an Arc measurement (in one Arc database) fed by both a narrow and a
+//     wide source measurement (--measurement-map): one table cannot hold
+//     both layouts.
+func checkNarrow(cfg runConfig, names map[string]int, tags map[string]map[string]bool, byDB map[string]map[string]bool, resumed bool) error {
 	if !cfg.narrow.enabled() {
 		return nil
 	}
@@ -221,11 +234,16 @@ func checkNarrow(cfg runConfig, names map[string]int, tags map[string]map[string
 			unknown = append(unknown, m)
 		}
 	}
+	// A warning, not a refusal: runs batched by --database-filter or a time
+	// window commonly share one --narrow list. A misspelt name leaves its
+	// measurement wide, and a wide load of a sparse measurement fails fast
+	// with Arc's 413, so the mistake surfaces at once either way.
 	if len(unknown) > 0 {
-		if !resumed {
-			return fmt.Errorf("pre-flight: --narrow names %q, which no source measurement in the time window has; NOTHING was sent. Use source measurement names (as --analyze shows them), not renamed ones", unknown)
+		where := "in the time window"
+		if resumed {
+			where = "in the shards still to load (shards already done were not read)"
 		}
-		fmt.Printf("pre-flight: WARNING: --narrow names %q, found in none of the shards still to load (shards already done were not read)\n", unknown)
+		fmt.Printf("pre-flight: WARNING: --narrow names %q, which no source measurement %s has; check the spelling (source names, as --analyze shows them, not renamed ones)\n", unknown, where)
 	}
 	var clashes []string
 	for _, m := range cfg.narrow.sorted() {
@@ -244,25 +262,33 @@ func checkNarrow(cfg runConfig, names map[string]int, tags map[string]map[string
 		return fmt.Errorf("pre-flight: --narrow cannot write these measurements; NOTHING was sent:\n%s\nchoose another --narrow-tag (the value columns are %s)",
 			strings.Join(clashes, "\n"), strings.Join(lp.NarrowValueColumns, ", "))
 	}
-	// One Arc table, two layouts: resolve every source name once (serially).
-	layout := map[string]bool{} // Arc name → narrow
-	from := map[string]string{} // Arc name → the source name that set its layout
-	srcs := make([]string, 0, len(names))
-	for m := range names {
-		srcs = append(srcs, m)
+	// One Arc table, two layouts: a table is a measurement in one Arc
+	// database. Resolve every source name once (serially).
+	dbs := make([]string, 0, len(byDB))
+	for db := range byDB {
+		dbs = append(dbs, db)
 	}
-	sort.Strings(srcs)
-	for _, m := range srcs {
-		res := cfg.resolver.Resolve(m)
-		if res.Name == "" {
-			continue // skipped or invalid: never sent
+	sort.Strings(dbs)
+	for _, db := range dbs {
+		layout := map[string]bool{} // Arc name → narrow
+		from := map[string]string{} // Arc name → the source name that set its layout
+		srcs := make([]string, 0, len(byDB[db]))
+		for m := range byDB[db] {
+			srcs = append(srcs, m)
 		}
-		n := cfg.narrow.has(m)
-		if prev, seen := layout[res.Name]; seen && prev != n {
-			return fmt.Errorf("pre-flight: Arc measurement %q would get source measurements %q and %q, only one of them in --narrow; one table cannot hold both layouts. NOTHING was sent", res.Name, from[res.Name], m)
+		sort.Strings(srcs)
+		for _, m := range srcs {
+			res := cfg.resolver.Resolve(m)
+			if res.Name == "" {
+				continue // skipped or invalid: never sent
+			}
+			n := cfg.narrow.has(m)
+			if prev, seen := layout[res.Name]; seen && prev != n {
+				return fmt.Errorf("pre-flight: Arc measurement %s.%s would get source measurements %q and %q, only one of them in --narrow; one table cannot hold both layouts. NOTHING was sent", db, res.Name, from[res.Name], m)
+			}
+			layout[res.Name] = n
+			from[res.Name] = m
 		}
-		layout[res.Name] = n
-		from[res.Name] = m
 	}
 	if len(cfg.narrow.measurements) > 0 {
 		fmt.Printf("pre-flight: --narrow: %d measurement(s) in the narrow layout, tag %q\n", len(cfg.narrow.measurements), cfg.narrow.tag)
