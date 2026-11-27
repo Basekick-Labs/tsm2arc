@@ -33,7 +33,7 @@ Download a prebuilt binary from [Releases](https://github.com/basekick-labs/tsm2
 (Linux/macOS/Windows, amd64/arm64), or:
 
 ```bash
-# from source (Go 1.25+)
+# from source (Go 1.26+)
 go install github.com/basekick-labs/tsm2arc/cmd/tsm2arc@latest
 
 # container
