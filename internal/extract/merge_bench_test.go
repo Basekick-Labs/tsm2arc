@@ -1,6 +1,7 @@
 package extract
 
 import (
+	"context"
 	"testing"
 
 	"github.com/basekick-labs/tsm2arc/internal/tsm"
@@ -33,7 +34,7 @@ func BenchmarkMergeWideSplitSeries(b *testing.B) {
 		}
 		var st Stats
 		b.StartTimer()
-		if err := mergeSeries("cpu,host=x", "cpu", [][2]string{{"host", "x"}}, streams, &st, func(Point) {}); err != nil {
+		if err := mergeSeries(context.Background(), "cpu,host=x", "cpu", [][2]string{{"host", "x"}}, streams, &st, func(Point) {}); err != nil {
 			b.Fatal(err)
 		}
 		if st.Points != rows {

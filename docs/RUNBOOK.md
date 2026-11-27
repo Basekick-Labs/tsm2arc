@@ -337,6 +337,57 @@ change them mid-migration (tsm2arc refuses if you do — see §6).
 
 ---
 
+## 3b. Very wide, sparse measurements (`--narrow`)
+
+Arc stores a measurement as dense columns: every row has a cell, filled or
+empty, for every field the measurement has. Data written field by field at
+each field's own rate (a few fields per timestamp out of hundreds or
+thousands) is mostly empty cells in that form. Arc refuses an import whose
+empty cells outnumber its values more than 8 to 1 in a 4 MiB piece of the
+request (`413 ... too many empty cells`), and a measurement of thousands of
+columns is also hard for Arc to compact and query.
+
+Look for it before loading: on the source, `SHOW FIELD KEYS FROM <measurement>`
+lists a measurement's fields. If a measurement has more than a few hundred
+fields and a typical line carries only a small share of them (the dry run's
+`--sample` lines show how many a line has), load it narrow:
+
+```bash
+tsm2arc --datadir <...> --arc-url <...> --narrow table_w,table_x
+```
+
+Each point becomes one line per field. A point `table_w a=1.5,b=7i 1700000000000000000`
+is sent as:
+
+```text
+table_w,field=a value=1.5 1700000000000000000
+table_w,field=b value_int=7i 1700000000000000000
+```
+
+- Names are **source** measurement names, as `--analyze` shows them (before
+  `--measurement-map`). The pre-flight check (in the dry run too) refuses,
+  before anything is sent, a measurement with a tag the narrow layout cannot
+  write next to (the narrow tag, or a value column's name in any letter
+  case: pick another `--narrow-tag`), and an Arc measurement that would get
+  both a narrow and a wide source. A name that matches no measurement in
+  the run's scope is only a warning (so batched runs can share one list):
+  check the spelling when you see it.
+- Value columns by type: float `value`, integer `value_int`, unsigned
+  `value_uint`, boolean `value_bool`, string `value_str`.
+- Query it by field: `SELECT time, value FROM db.table_w WHERE field = 'a'`;
+  pivot the few fields a query needs with `PIVOT` or `max(CASE ...)`.
+- `--narrow` and `--narrow-tag` are part of the checkpoint's fingerprint:
+  a run cannot be resumed with them added, removed or changed.
+- Row counts: Arc holds one row per field value for a narrow measurement, not
+  one per point (see §7).
+
+**Switching a measurement that was already partly loaded wide**: start a
+new checkpoint (`--checkpoint` to a new file), and drop what the wide run
+already wrote to Arc for that measurement first (or load the narrow form
+under another name with `--measurement-map`). A table cannot hold both
+layouts, and leftover wide columns such as a field named `value` with another
+type would make Arc refuse the narrow rows.
+
 ## 4. Size `--workers` against the Arc node
 
 `--workers N` migrates N shards concurrently (default 2). **The binding
@@ -509,6 +560,14 @@ Re-run the **exact same command**. The tool:
   sending continues at the first un-acknowledged chunk within seconds to
   minutes — not hours of re-decoding.
 
+**When Arc refuses a chunk outright** (a 4xx such as 413 or 400, which
+retrying cannot fix), tsm2arc stops: the shard's extraction ends, the other
+shards stop, queued shards do not start, and the run exits non-zero with
+Arc's message. In-flight requests finish or are cancelled first, so the
+exit takes seconds, not the rest of the shard. Fix the cause (for a 413
+"too many empty cells", §3b) and re-run; a flag that changes what is sent
+(`--narrow`) needs a new checkpoint, so read §3b's note on switching first.
+
 A checkpoint written by tsm2arc ≤ 0.1.4 has no cursor; those shards fall back to
 the old behavior (re-derive everything, skip already-sent chunks without
 re-sending). The heartbeat's `+N skipped on resume` counter shows that phase.
@@ -556,6 +615,13 @@ curl -s -X POST "https://arc.example.net/api/v1/query" \
   -d "{\"sql\": \"SELECT count(*) FROM <database>.<measurement> WHERE time >= '<start>' AND time <= '<end>'\"}"
 ```
 
+- **Narrow** measurements (`--narrow`): Arc holds one row per field value,
+  so compare Arc's `count(*)` with the source's field-value count, not its
+  point count. On InfluxDB 1.x, `SELECT count(*) FROM <measurement>` returns
+  one count per field: their sum is that number. The dry run's `fields`
+  total is per database, so it matches only when the narrow measurement is
+  the database's only one. The run's "imported N rows" counts these rows
+  too.
 - **Tag-bearing** data: after Arc compaction runs, counts should match exactly.
 - **Tagless** data: a small positive delta on Arc's side = resume-overlap
   duplicates (bounded to ≤1 chunk per shard per crash, per §6); a clean,
@@ -604,7 +670,8 @@ will skip everything already done and add only the WAL-resident data).
 | 2.x buckets show as 16-hex IDs | `influxd.bolt` missing/unreadable | provide `--bolt` or copy `influxd.bolt` next to `engine/` |
 | `arc 401` / permanent error | token not admin-tier or wrong | use an admin token |
 | `invalid measurement name …` (from tsm2arc, before sending) | source measurement names violate Arc's rule (dots etc.) | see §3a: `--dry-run` to list them, then `--measurement-map`/`--measurement-map-file`, or `--on-invalid-measurement=skip\|map` |
-| `arc 413` | `--chunk-bytes` too large for Arc's cap | keep `--chunk-bytes` < 500MB (default 450MB is safe) |
+| `arc 413` ... `too many empty cells` | a very wide measurement whose lines carry few of its fields | load it with `--narrow` (§3b) |
+| `arc 413` (other) | `--chunk-bytes` too large for Arc's cap | keep `--chunk-bytes` < 500MB (default 450MB is safe) |
 | Repeated `arc 429` then backoff | Arc under load / too many workers | lower `--workers` and/or `--chunk-bytes` |
 | Arc node OOM | `--workers` too high for Arc's RAM | lower `--workers`; see §4 memory math |
 | `checkpoint was created with different settings` | resuming with a changed `--chunk-bytes`/`--start`/`--end`/`--db-map`/`--precision`/`--measurement-map`/`--on-invalid-measurement` | restore the original flags, or use a fresh `--checkpoint` (full re-migration) |
@@ -633,6 +700,8 @@ tsm2arc \
   --database-filter DB  migrate only this source DB (repeatable)
   --measurement-map old=new       rename a source measurement (repeatable)
   --measurement-map-file PATH     file of renames, one old=new per line
+  --narrow m1,m2                  one line per field for these source measurements (§3b)
+  --narrow-tag NAME               tag holding the field name (default field)
   --on-invalid-measurement MODE   fail|skip|map for names Arc rejects (default fail)
   --start / --end       RFC3339 UTC time filters
   --precision ns|us|ms|s  precision sent to Arc (default ns; tsm2arc always emits ns)

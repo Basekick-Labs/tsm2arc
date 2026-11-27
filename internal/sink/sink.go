@@ -133,6 +133,10 @@ type Result struct {
 // than 429 is permanent and returned immediately. The lp slice is the RAW
 // (uncompressed) line protocol for one chunk; the caller must keep it <500 MB.
 func (s *Sink) Send(ctx context.Context, db string, lp []byte) (Result, error) {
+	// A load that already failed must not gzip and POST another chunk.
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
 	body, contentType, err := buildMultipartGzip(lp)
 	if err != nil {
 		return Result{}, fmt.Errorf("build request body: %w", err)
@@ -157,6 +161,12 @@ func (s *Sink) Send(ctx context.Context, db string, lp []byte) (Result, error) {
 		lastErr = err
 		if !retryable {
 			return Result{}, err
+		}
+		// A cancelled request surfaces as a transport error, which reads as
+		// retryable. It is not: the load is stopping (another chunk or shard
+		// failed). Logging "retrying" here hid that for hours.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return Result{}, ctxErr
 		}
 		// A retryable transport failure often means the pooled keep-alive is
 		// dead (e.g. a server rolled behind a proxy). Drop idle connections so

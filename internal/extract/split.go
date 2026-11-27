@@ -373,7 +373,10 @@ func shardParallel(si *shardIndex, tsmFiles []string, openTSM OpenTSM, start, en
 		return st, err
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	// Derived from the caller's context: a load that failed elsewhere stops
+	// the scheduler and the workers, not only this shard's own errors.
+	parent := opt.ctxOf()
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	budget := newMemBudget(ctx, opt.MemoryBudget)
 	pool := &batchPool{ch: make(chan *pointBatch, opt.Workers*4)}
@@ -421,6 +424,10 @@ func shardParallel(si *shardIndex, tsmFiles []string, openTSM OpenTSM, start, en
 	var firstErr error
 	for h := range ordered {
 		for b := range h.batches {
+			if firstErr == nil && parent.Err() != nil {
+				firstErr = parent.Err()
+				cancel()
+			}
 			if firstErr == nil {
 				for i := range b.pts {
 					fn(b.pts[i])
@@ -444,6 +451,13 @@ func shardParallel(si *shardIndex, tsmFiles []string, openTSM OpenTSM, start, en
 		budget.release(h.est)
 	}
 	wg.Wait()
+	// The scheduler stops admitting tasks when the caller's context ends, and
+	// closes ordered as if the shard were done; tasks never started carry no
+	// error. Without this a cancel between tasks returned nil, and the
+	// caller marked a partly read shard done.
+	if firstErr == nil {
+		firstErr = parent.Err()
+	}
 	return st, firstErr
 }
 
@@ -464,7 +478,7 @@ func runSplitTask(ctx context.Context, t *splitTask, tsmFiles []string, openTSM 
 	}
 
 	em := &batchEmitter{ctx: ctx, out: h.batches, pool: pool}
-	err := mergeSeries(t.sk, t.measurement, t.tags, streams, &h.stats, em.emit)
+	err := mergeSeries(ctx, t.sk, t.measurement, t.tags, streams, &h.stats, em.emit)
 	for _, s := range streams {
 		s.release()
 	}

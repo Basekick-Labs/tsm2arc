@@ -116,6 +116,13 @@ natural root and it resolves the rest:
 #                                   (deterministic auto-rename)
 #   --chunk-bytes SIZE       raw-LP per import request; bytes or a suffix like
 #                            450MB (must be <500MB; default 450MB)
+#   --narrow m1,m2           write these SOURCE measurements one line per field:
+#                            the field's name as a tag, its value in value /
+#                            value_int / value_uint / value_bool / value_str.
+#                            For very wide measurements whose fields are mostly
+#                            absent on a line (see the runbook, §3b)
+#   --narrow-tag NAME        with --narrow: the tag holding the field name
+#                            (default field)
 #   --checkpoint PATH        SQLite resume store (default tsm2arc.checkpoint.db)
 #   --start / --end          RFC3339 UTC time filters
 #   --precision ns|us|ms|s   precision value sent to Arc (default ns; tsm2arc always emits ns)

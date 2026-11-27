@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -129,5 +132,55 @@ func TestSinkAuthRequired(t *testing.T) {
 	_, err := s.Send(context.Background(), "db", []byte("m v=1 1\n"))
 	if err == nil {
 		t.Fatal("expected auth failure")
+	}
+}
+
+// A load that is stopping sends nothing more, and a request cut off by the
+// stop is not logged as "retrying": 0.2.0 logged a cancelled context as a
+// retryable transport error, hiding a permanent 413 behind "retrying" lines.
+func TestSinkStopsOnCancelledContext(t *testing.T) {
+	var calls int32
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		<-release
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	defer close(release)
+	var logs []string
+	var mu sync.Mutex
+	s := New(srv.URL, "tok", "ns", WithRetry(3, time.Millisecond, 5*time.Millisecond))
+	s.SetLogger(func(f string, a ...any) {
+		mu.Lock()
+		logs = append(logs, fmt.Sprintf(f, a...))
+		mu.Unlock()
+	})
+
+	dead, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.Send(dead, "db", []byte("m v=1 1\n")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("send on a cancelled context: %v", err)
+	}
+	if n := atomic.LoadInt32(&calls); n != 0 {
+		t.Fatalf("%d requests on a cancelled context", n)
+	}
+
+	ctx, cancel2 := context.WithCancel(context.Background())
+	go func() {
+		for atomic.LoadInt32(&calls) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel2()
+	}()
+	if _, err := s.Send(ctx, "db", []byte("m v=1 1\n")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("send cut off by a cancel: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, l := range logs {
+		if strings.Contains(l, "retrying") {
+			t.Fatalf("a cancelled request was logged as retrying: %q", l)
+		}
 	}
 }
